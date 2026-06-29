@@ -27,7 +27,7 @@ pub use collection::{
 pub use connections::ConnectionGraph;
 pub use diff::{ApplyMode, Diff, Edit, FieldValue};
 pub use editor::{NamespaceEditError, NamespaceEditor};
-pub use interp::InterpolationType;
+pub use interp::{evaluate, InterpolationType};
 pub use prim::{Prim, PrimIndexRef, VariantSets};
 pub use relationship::Relationship;
 pub use schema::{SchemaBase, SchemaKind};
