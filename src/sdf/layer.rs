@@ -46,11 +46,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
+use crate::ar;
+
 use super::schema::FieldKey;
 use super::{
     sink, AbstractData, AttributeSpecMut, AttributeSpecRef, ChangeList, CowData, Data, DataError, LayerData, Patch,
     Path, PrimSpecMut, PrimSpecRef, PseudoRootSpecMut, PseudoRootSpecRef, RelationshipSpecMut, RelationshipSpecRef,
-    RelocateList, SpecError, SpecType,
+    RelocateList, SpecError, SpecType, Value,
 };
 
 /// A [`sink::Id`] for a [`LayerSink`] installed on a [`Layer`].
@@ -65,10 +67,26 @@ const ANONYMOUS_PREFIX: &str = "anon:";
 /// in the process never collide.
 static ANONYMOUS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic source of transaction ids stamped onto every [`edit_layers`] group
+/// (see [`PendingLayerChange::generation`]). Process-global so an observer can
+/// tell one atomic transaction's commits from the next regardless of which layer
+/// or stage they land on.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// A single loaded layer in the composition.
 pub struct Layer {
     /// Resolved, canonical identifier for this layer.
     pub identifier: String,
+    /// The layer's resolved physical location when it differs from
+    /// [`identifier`](Self::identifier) — the anchor for the relative asset
+    /// paths it authors (C++ `SdfLayer::GetRealPath`). `None` (the common case)
+    /// means it equals the identifier; a package (`.usdz`) opens under the bare
+    /// package identifier while its real path is the package-relative default
+    /// layer (`pkg.usdz[root.usd]`), so paths authored inside it anchor
+    /// in-package against the real path rather than the identifier. Read
+    /// through [`real_path`](Self::real_path), which falls back to the
+    /// identifier.
+    real_path: Option<String>,
     /// The parsed scene description data, under a copy-on-write [`CowData`]
     /// staging overlay. Every authoring write stages in the overlay; committing an
     /// edit derives the composition record and drains the overlay into the backend.
@@ -93,8 +111,30 @@ impl Layer {
     /// for blank in-memory layers, or open a stage (which loads layers from
     /// disk on demand) for loaded layers.
     pub(crate) fn new(identifier: impl Into<String>, data: LayerData) -> Self {
+        Self::build(identifier.into(), None, data)
+    }
+
+    /// Construct a loaded layer recording its resolved physical location.
+    ///
+    /// The loader passes the [`real_path`](Self::real_path) it resolved the
+    /// layer to: it equals `identifier` for an ordinary layer, but a package
+    /// opens under its bare identifier while its real path is the
+    /// package-relative default layer, so the paths it authors anchor
+    /// in-package. Only a real path that differs from the identifier is stored;
+    /// otherwise this is [`new`](Self::new).
+    pub(crate) fn new_resolved(identifier: impl Into<String>, real_path: &ar::ResolvedPath, data: LayerData) -> Self {
+        let identifier = identifier.into();
+        let real_path = real_path.to_string();
+        let real_path = (real_path != identifier).then_some(real_path);
+        Self::build(identifier, real_path, data)
+    }
+
+    /// Shared constructor backing [`new`](Self::new) and
+    /// [`new_resolved`](Self::new_resolved).
+    fn build(identifier: String, real_path: Option<String>, data: LayerData) -> Self {
         Self {
-            identifier: identifier.into(),
+            identifier,
+            real_path,
             data: CowData::new(data),
             changes: ChangeList::new(),
             sinks: sink::Set::default(),
@@ -176,10 +216,11 @@ impl Layer {
 
     /// Refill this layer's change record from the staged overlay against the
     /// still-pristine base, and offer it to each sink's
-    /// [`before_commit`](LayerSink::before_commit) while the overlay is intact. A
-    /// sink's rejection leaves the overlay staged for the caller to roll back. Does
-    /// not touch the backend.
-    fn prepare_commit(&mut self) -> Result<(), sink::Error> {
+    /// [`before_commit`](LayerSink::before_commit) while the overlay is intact,
+    /// tagged with the enclosing transaction's `generation`. A sink's rejection
+    /// leaves the overlay staged for the caller to roll back. Does not touch the
+    /// backend.
+    fn prepare_commit(&mut self, generation: u64) -> Result<(), sink::Error> {
         self.changes.update(&self.data);
         if !self.changes.is_empty() && !self.sinks.is_empty() {
             let change = PendingLayerChange {
@@ -187,6 +228,7 @@ impl Layer {
                 base: &**self.data.base(),
                 overlay: self.data.overlay(),
                 change_list: &self.changes,
+                generation,
             };
             self.sinks.iter().try_for_each(|sink| sink.before_commit(&change))?;
         }
@@ -236,6 +278,14 @@ impl Layer {
     /// The layer's resolved, canonical identifier.
     pub fn identifier(&self) -> &str {
         &self.identifier
+    }
+
+    /// The layer's resolved physical location, the anchor for the relative
+    /// asset paths it authors (C++ `SdfLayer::GetRealPath`). Equals the
+    /// identifier except for a package, whose real path is its package-relative
+    /// default layer.
+    pub(crate) fn real_path(&self) -> &str {
+        self.real_path.as_deref().unwrap_or(&self.identifier)
     }
 }
 
@@ -413,6 +463,11 @@ pub struct PendingLayerChange<'a> {
     /// needs to retain it past the callback clones it ([`ChangeList`] is
     /// [`Clone`]).
     pub change_list: &'a ChangeList,
+    /// The id of the atomic transaction ([`edit_layers`] group) this commit
+    /// belongs to: one id shared by every layer the transaction commits, distinct
+    /// from the next transaction's, and monotonically increasing. An observer
+    /// keys per-transaction state on it (see [`crate::usd::UndoStage`]).
+    pub generation: u64,
 }
 
 /// Identity, persistence, and typed-view lookups. Spec authoring lives on the
@@ -683,6 +738,19 @@ impl LayerEdit<'_> {
         self.clear_root_field(FieldKey::LayerRelocates)
     }
 
+    /// Replace the layer's `expressionVariables` dictionary, the values an
+    /// `${VAR}` expression resolves against (see
+    /// [`PseudoRootSpec::set_expression_variables`](crate::sdf::PseudoRootSpec::set_expression_variables)).
+    pub fn set_expression_variables(&mut self, vars: HashMap<String, Value>) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_expression_variables(vars);
+        Ok(())
+    }
+
+    /// Clear the layer's `expressionVariables` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_expression_variables(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::ExpressionVariables)
+    }
+
     /// Set the layer's `startTimeCode`.
     pub fn set_start_time_code(&mut self, time: f64) -> Result<(), AuthoringError> {
         self.pseudo_root_mut()?.set_start_time_code(time);
@@ -780,10 +848,13 @@ pub(crate) fn edit_layers<E: From<sink::Error>>(
         // `edits` drops at the block end, releasing the per-layer borrows for the
         // commit phase below.
     }
+    // One id for the whole atomic group, so an observer sees every layer this
+    // transaction commits under a single transaction id.
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     // Phase 1: refill each layer's record and offer it to that layer's
     // `before_commit`; a veto aborts before any layer commits.
     for layer in guard.layers.iter_mut() {
-        layer.prepare_commit()?;
+        layer.prepare_commit(generation)?;
     }
     // Phase 2: every layer accepted, so drain each overlay into its backend. Commit
     // all layers before notifying any, so the whole group's data lands even if a

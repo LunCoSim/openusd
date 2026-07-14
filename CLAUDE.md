@@ -24,7 +24,7 @@ The codebase mirrors the C++ OpenUSD SDK's module layout. The bullets below are 
 
 - **`pcp/`** - Prim Cache Population, the composition engine (C++ `Pcp`): LIVERPS strength ordering across layers, kept a pure function of `(graph, context, cached indices)` so it stays parallelizable. Composition drives layer loading: a reference/payload target opens on first use and the demand travels out through `BuildOutput` to the stage's load barrier. Start at `pcp/mod.rs` — it has the LIVERPS overview and a per-file structure table.
 
-- **`usd/`** - Composed stage API (C++ `Usd`): `usd::Stage` is the handle that delegates composition to `pcp::IndexCache`; `Prim`, `Attribute`, `Relationship`, and the schema views are `Clone` value types over it, and stage-tier authoring routes through the current `EditTarget`, with `Stage::batch_edit` for atomic multi-layer edits. Notable sub-surfaces: `usd/sink.rs` (`StageSink` composed-change observers, `Provenance`), `usd/diff.rs` (edit replication), `usd/editor.rs` (namespace editing). Start at `usd/stage.rs`. Public users import modules (`use openusd::{sdf, usd};`), not root-level re-exports.
+- **`usd/`** - Composed stage API (C++ `Usd`): `usd::Stage` is the handle that delegates composition to `pcp::IndexCache`; `Prim`, `Attribute`, `Relationship`, and the schema views are `Clone` value types over it, and stage-tier authoring routes through the current `EditTarget`, with `Stage::batch_edit` for atomic multi-layer edits. Notable sub-surfaces: `usd/sink.rs` (`StageSink` composed-change observers, `Provenance`), `usd/diff.rs` (the transferable `Diff` and `Stage::apply_diff`), `usd/capture.rs` (`UndoStage` / `ReplayStage`, recording wrappers over the change seam), `usd/editor.rs` (namespace editing). Start at `usd/stage.rs`. Public users import modules (`use openusd::{sdf, usd};`), not root-level re-exports.
 
 - **`schemas/`** - Domain schemas layered on `sdf` / `usd`, not part of the AOUSD core spec. Feature-gated per family (`geom`, `lux`, `media`, `physics`, `proc`, `render`, `shade`, `skel`, `ui`, `vol`; some enable `geom` transitively). See the table in `schemas/mod.rs`.
 
@@ -90,6 +90,15 @@ When implementing a new feature from the spec:
 - Comprehensive test coverage (50% minimum) with grcov
 - Security auditing with cargo-deny
 - Pre-1.0: backward compatibility is not a constraint. Prefer the cleanest design and change or remove public APIs freely; don't keep deprecated shims, compatibility shims, or worse-but-compatible behavior. Update all call sites in the same change.
+- Prefer an architecturally correct design over a quick, dirty, or bandaid fix.
+  Fix the root cause at the layer that owns the concept, not the symptom at the
+  call site. A special case layered onto shared infrastructure (an `if this one
+  format` branch, or a value re-derived from a string because the right field
+  was not carried) signals the fix is at the wrong altitude — generalize the
+  mechanism or carry the missing state instead. When a module mirrors C++
+  OpenUSD, factor the concern the way the C++ model does (e.g. a layer's lexical
+  identifier vs. its resolved real path). Note genuinely deferred depth as a
+  `TODO` naming the missing generalization.
 
 ## Code Quality
 

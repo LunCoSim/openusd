@@ -49,7 +49,7 @@
 //! | `layer_stack` | `PcpLayerStack` identity | Composed-stack identity ([`LayerStackId`]) and the registry of context-keyed instances (`LayerStackRegistry`): a [`LayerId`] names a physical layer, a [`LayerStackId`] a composed view under a context, so a `${VAR}` sublayer reached through two contexts resolves independently. |
 //! | `index_cache` | `PcpCache` | Lazily-built composition cache (`IndexCache`). Main interface for [`Stage`](crate::usd::Stage). Borrows the `layer_graph` per query. |
 //! | `instancing` | `Pcp` instancing | Scene-graph instancing (spec 11.3.3): the `PrototypeRegistry` object (owned by `IndexCache`) plus the composition glue (`is_instance`, the `effective_path` redirection that maps an instance proxy's subtree onto the shared `/__Prototype_N` namespace) as a second `IndexCache` impl. |
-//! | [`Error`] | `PcpErrorBase` | Composition errors: arc cycles, unresolved layers, missing/invalid `defaultPrim`, arc-to-private-site permission denials. |
+//! | [`Error`] | `PcpErrorBase` | Composition errors: arc cycles, unresolved layers, missing/invalid `defaultPrim`. |
 //! | `prim_index` | `PcpPrimIndex` | Per-prim composition support: the [`PrimIndex`] type with its build entry points (`build_with_cache` / `build_with_cache_in`) and the [`CompositionContext`](prim_index::CompositionContext) that flows parent-to-child. |
 //! | `compose_site` | `PcpComposeSite` | Site field composition: the list-op primitives (`compose_references_in`, `collect_payloads_in`, `compose_arc_list_in`) the `prim_indexer` drives to read a node's arc fields across its layer stack, plus the asset-path anchoring and time-codes retiming they fold in. |
 //! | `prim_indexer` | `Pcp_PrimIndexer` | Task-queue composition engine (`Indexer`): grows the graph node-by-node by draining a priority task queue. The sole composition path. |
@@ -57,6 +57,7 @@
 //! | `prim_resolve` | — | Value resolution over a composed [`PrimIndex`]: the per-field strength-ordered opinion walk (spec section 12). |
 //! | `mapping` | `PcpMapFunction` | Namespace mapping between composition arcs — each [`Node`] carries `map_to_parent` and `map_to_root`. |
 //! | [`VariantFallbackMap`] | `PcpVariantFallbackMap` | Maps variant set names to ordered fallback selections, used when no selection is authored. |
+//! | `load_rules` | `UsdStageLoadRules` | Per-path payload-inclusion policy ([`LoadRules`]/[`Rule`]): nearest-ancestor-with-lookahead rule resolution, plus the `IndexCache` glue that turns a rule change into per-build payload-expansion decisions and bounded cache invalidation. |
 //! | `relocates` | — | Stateless relocate free functions (effective relocates, transitive chaining, child-name folding). Layer-authored pairs and stack-effective queries are read from `LayerGraph`; all data is passed through parameters. |
 //! | `dependencies` | `Pcp_Dependencies` | Reverse `(LayerId, site) → prim-index paths` map (`Dependencies`) driving surgical change fanout. |
 //!
@@ -123,12 +124,15 @@
 //!      `active`) and by non-inert prim adds/removes.
 //!    - Prim — local rebuild only, descendants survive. Currently collapsed
 //!      into significant; the field exists for a future finer-grained split.
-//!    - Spec — graph is fine, only the spec stack changed. No-op while the
-//!      cache doesn't memoize the stacks; reserved for the future split.
+//!    - Spec — graph topology is fine, only a spec stack changed. An inert spec
+//!      add/remove rescans `has_specs` in place over the memoized per-node spec
+//!      stack and keeps the index.
 //!
-//!    Layer-stack-tier flags (sublayers, sublayer offsets, `layerRelocates`,
-//!    `defaultPrim`) cause the whole stack to be marked significant — every
-//!    cached index is dropped because composition topology may have shifted.
+//!    Layer-stack-tier flags (`subLayers`, sublayer offsets,
+//!    `timeCodesPerSecond`, `expressionVariables`, `layerRelocates`,
+//!    `defaultPrim`) recompose the affected layer stacks and drop only the
+//!    indices that read them (`IndexCache::invalidate_layers`), not the whole
+//!    cache.
 //!
 //! 3. [`Changes::apply`] surgically removes the affected entries from the
 //!    cache. Indices rebuild lazily on next access.
@@ -140,9 +144,11 @@
 //! ancestors of the changed site, since an arc at `/Foo` makes `/Foo/Bar`'s
 //! composition transitively dependent on `/Foo`.
 //!
-//! Property-tier authoring (attribute values, time samples, relationship
-//! targets) never invalidates the prim graph: those queries read live
-//! layer data on every call.
+//! Property-tier authoring (attribute values, time samples) never invalidates
+//! the prim graph: those queries read live layer data on every call. A
+//! `targetPaths`/`connectionPaths` edit likewise leaves the graph intact,
+//! clearing only the per-property resolved-target memo (keyed by path and
+//! target kind) so resolved targets recompute on next read.
 //!
 //! Layer muting ([`Stage::mute_layer`](crate::usd::Stage::mute_layer) /
 //! [`unmute_layer`](crate::usd::Stage::unmute_layer)) recomposes incrementally
@@ -180,13 +186,14 @@
 //!
 //! # Permissions (`permission = private`)
 //!
-//! A *direct* arc (a reference/inherit/payload/specialize authored at the prim)
-//! to a private target is denied: every node reached through it is marked
-//! [`NodeFlags::PERMISSION_DENIED`] so it stops contributing to value resolution
-//! while staying visible structurally, and the denial is reported as
-//! [`Error::ArcPermissionDenied`] (C++ `_AddArc` + `_InertSubtree`). The denied
-//! target paths flow down the `CompositionContext` so descendant prims composed
-//! separately (where the arc is *extended*, not authored) are inerted too.
+//! `permission` is `sdf`-level metadata only ([`sdf::Permission`]); composition
+//! and value resolution never read it. C++'s own arc-, prim-, and
+//! target-permission enforcement (`_AddArc`'s privacy check, `_EnforcePermissions`,
+//! `_TargetIsPermitted`) is compiled out for `Usd`-mode `PcpCache`s — the mode
+//! `UsdStage`, and therefore this crate, always uses — so a real stage never
+//! denies an arc or filters a target on `permission`. This is a deliberate
+//! parity choice, not a gap: editing `permission` is an ordinary metadata change
+//! with no composition effect.
 //!
 //! # Ordered prim children
 //!
@@ -208,11 +215,6 @@
 //!
 //! # Remaining work
 //!
-//! - Connection / relationship-target permission validity: a target pointing at a
-//!   site that is private relative to where the target is authored must be dropped
-//!   (C++ `_EnforcePermissions` plus connection/target validation). Needs a
-//!   value-resolution surface for target validity; `NodeFlags::PERMISSION_PRIVATE`
-//!   / `RESTRICTED` are reserved for it.
 //! - Cross-prim parallelism: `IndexCache::ensure_index` composes prims serially.
 //!   Each build is a pure function of `&LayerGraph`, the parent context, and the
 //!   cached indices (`TODO(rayon)`), but the shared `indices` map that
@@ -234,26 +236,36 @@
 //!   already composed during indexing. Storing the composed set on the index
 //!   (or each node) would remove the duplicate walk and the risk of the two
 //!   diverging.
-//! - Intra-instance shared-sublayer context: building a contextual stack's
+//! - Contextual-stack shared-sublayer context: building a contextual stack's
 //!   members (`LayerGraph::build_stack_members` → `compose_edges`) gates its walk
-//!   on a per-`LayerId` `visited` set, so within one instance a sublayer reached
-//!   through two different sublayer ancestries keeps the first ancestry's
-//!   expression-variable context. Per-context fidelity holds *across* arcs (each
-//!   gets its own instance) but not for a sublayer diamond *within* a single
-//!   instance; a per-`(layer, context)` edge walk would close it.
+//!   on a per-`LayerId` `visited` set, so a sublayer reached through two different
+//!   sublayer ancestries within one contextual stack keeps the first ancestry's
+//!   expression-variable context. Per-context fidelity holds *across* arcs — each
+//!   reference/payload target, and the session-seeded root stack, gets its own
+//!   instance — but not for a sublayer diamond *within* a single contextual stack;
+//!   a per-`(layer, context)` edge walk would close it.
 //! - Releasing a muted layer's memory: `LayerGraph` keeps a muted layer's node
 //!   interned so unmute is a rebuild; C++ drops its references. The node and its
 //!   backing data are retained for the life of the graph.
-//! - Unmuting a never-loaded target: a reference/payload to a layer muted before
-//!   it ever loaded is skipped at the demand point ([`Error::MutedAssetPath`])
-//!   without interning the target or recording a recomposition trace, so
-//!   `LayerGraph::mute_fanout` — which looks the canonical identifier up among the
-//!   interned layers only — yields an empty fanout, and the referrer's cached
-//!   index keeps its now-stale `MutedAssetPath` and unresolved arc. A loaded
-//!   target (whose muted root empties the sublayer stack) instead records
-//!   `muted_external_targets` and recomposes correctly. Fanning the unmute out by
-//!   canonical identifier to the indices that recorded a `MutedAssetPath` for it
-//!   would close it.
+//! - Muted sublayer diagnostics: the loader (`LayerRegistry::open_stack`) reports
+//!   every missing/unreadable sublayer raw, unaware of muting; the stage reports
+//!   only those a muted-aware check finds contributing
+//!   (`LayerGraph::sublayer_error_contributes` over `effective_layers`, the members
+//!   of every composed stack) and applies it at report time
+//!   (`Stage::composition_errors`). The raw diagnostics are never discarded, and the
+//!   effective set is a pure function of the muted set and the composed stacks — not
+//!   of which prim indices are cached — so a diagnostic's visibility is
+//!   deterministic: muting a branch suppresses it and unmuting restores it, for both
+//!   the root layer stack and reference/payload target stacks, and it never flickers
+//!   as the cache warms.
+//!   Remaining — precise target-diagnostic liveness: a reference/payload target
+//!   whose only arc becomes muted (the arc's authoring opinion is muted, but the
+//!   target root itself is not) stays interned with a non-empty stack, so its own
+//!   missing-sublayer diagnostic keeps reporting even though no unmuted arc reaches
+//!   it — a conservative over-report. Resolving it precisely means attaching
+//!   collection diagnostics to composition sites / stack instances so their
+//!   visibility tracks index lifetime and recomposition, rather than deriving it
+//!   from the composed-stack set.
 //! - Masked cold prototype queries: a query on a `/__Prototype_N` path under a
 //!   non-default population mask resolves to empty until an instance sharing
 //!   that prototype has been composed (which registers the prototype). The
@@ -264,14 +276,15 @@
 //!   through an instance (`Prim::prototype`, or any instance-proxy query) first
 //!   registers it, after which masked prototype-content queries (including those
 //!   behind a lazily-loaded payload) resolve correctly.
-//! - Open-time muted-sublayer collection diagnostics:
-//!   `StageBuilder::mute(...).open(...)` seeds the muted set after collection, so
-//!   a missing sublayer under a muted layer still surfaces as an
-//!   `UnresolvedSublayer` collection error. Applying the muted set during
-//!   collection and checking it before the unresolved-sublayer error would
-//!   suppress it. A reference/payload target is reached only at query time, after
-//!   the muted set is seeded, so a muted one is recognized at the demand point and
-//!   reported [`Error::MutedAssetPath`].
+//! - Runtime session-selected root sublayers: a session `expressionVariables`
+//!   edit, or a mute that exposes the root layer's own variable, can newly select
+//!   a root `${VAR}` sublayer the initial session variables never opened. Runtime
+//!   session-variable changes resolve root sublayers only against already-interned
+//!   layers (`Stage::apply_mute`), so a newly-selected layer is not loaded — the
+//!   open-time builder path (`StageBuilder::session_expression_variables`) loads
+//!   the initial selection, and a mute that *removes* a variable drops the sublayer
+//!   it selected. Loading a newly-selected one at runtime needs an on-demand
+//!   sublayer open through the graph.
 //!
 //! See <https://openusd.org/release/glossary.html#livrps-strength-ordering>
 
@@ -286,6 +299,7 @@ mod index_store;
 pub(crate) mod instancing;
 pub(crate) mod layer_graph;
 pub(crate) mod layer_stack;
+pub(crate) mod load_rules;
 mod mapping;
 pub(crate) mod prim_graph;
 pub(crate) mod prim_index;
@@ -298,9 +312,10 @@ use crate::sdf::{self, Path, Value};
 
 pub(crate) use change::{Changes, LayerStackChanges};
 pub(crate) use index_cache::{AttributeValueSource, IndexCache};
-pub(crate) use layer_graph::{LayerGraph, MuteChange};
+pub(crate) use layer_graph::{muted_subtree, LayerGraph, MuteChange};
 pub use layer_graph::{LayerId, LayerStackIdentifier};
 pub(crate) use layer_stack::LayerStackId;
+pub use load_rules::{LoadRules, Rule};
 pub use mapping::MapFunction;
 pub use prim_graph::{ArcType, Node, NodeFlags, NodeId};
 pub(crate) use prim_index::Demand;
@@ -451,22 +466,6 @@ pub enum Error {
         site_path: Path,
     },
 
-    /// A reference or payload authored inside a `.usdz` package names another
-    /// layer, which would require opening a sibling layer within the archive —
-    /// not yet supported (the eager collector bailed the same way). The arc is
-    /// dropped while the rest of the prim composes.
-    #[error("unsupported {arc:?} @{asset_path}@ inside usdz package @{introduced_by}@ at {site_path}")]
-    UnsupportedUsdzReference {
-        /// The reference/payload asset path authored inside the package.
-        asset_path: String,
-        /// The composition arc type.
-        arc: ArcType,
-        /// Identifier of the usdz package layer that authored the arc.
-        introduced_by: String,
-        /// The prim path where the arc was authored.
-        site_path: Path,
-    },
-
     /// A reference/payload resolved its target layer, but the named prim path
     /// authors no spec there (C++ `PcpErrorUnresolvedPrimPath`). The arc is
     /// dropped while the rest of the prim still composes.
@@ -522,20 +521,6 @@ pub enum Error {
         site_path: Path,
         /// The parse or evaluation failure.
         message: String,
-    },
-
-    /// A direct composition arc (a reference/inherit/payload/specialize
-    /// authored at the prim) targets a site whose composed permission is
-    /// `private` (spec 10.3.3). C++ records `PcpErrorArcPermissionDenied`; the
-    /// arc is reported but the node is retained, so this is recoverable.
-    #[error("{arc:?} arc at {site_path} targets private site {target_path}")]
-    ArcPermissionDenied {
-        /// The prim where the arc is authored.
-        site_path: Path,
-        /// The composition arc type.
-        arc: ArcType,
-        /// The private site the arc targets.
-        target_path: Path,
     },
 
     /// A composition arc (inherit/specialize/reference/payload/relocate) targets

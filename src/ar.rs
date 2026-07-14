@@ -60,8 +60,16 @@ impl ResolvedPath {
     /// format case-insensitively — `resolved.extension() == "usdz"` — the way the
     /// format registry's `find_by_extension` does, without juggling `OsStr`.
     pub(crate) fn extension(&self) -> String {
-        self.0
-            .extension()
+        // For a package-relative path (`pkg.usdz[inner/layer.usd]`) the format is
+        // the innermost packaged layer's extension, not the literal trailing
+        // chars (`.usd]`), so inspect the inner path rather than `self.0`.
+        let s = self.0.to_string_lossy();
+        let inner = is_package_relative_path(&s)
+            .then(|| split_package_relative_path_inner(&s))
+            .flatten()
+            .map(|(_, inner)| inner);
+        let path = inner.as_deref().map(Path::new).unwrap_or(self.0.as_path());
+        path.extension()
             .and_then(|ext| ext.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default()
@@ -283,6 +291,18 @@ impl Resolver for DefaultResolver {
             return String::new();
         }
 
+        // An already package-relative asset path (`pkg.usdz[inner]`): anchor its
+        // outer package path like any other path (so a relative `pkg.usdz` is
+        // resolved against the anchor), then nest the inner packaged path back
+        // inside the anchored package.
+        if is_package_relative_path(asset_path) {
+            if let Some((package, inner)) = split_package_relative_path_outer(asset_path) {
+                let anchored = self.create_identifier(&package, anchor);
+                return nest_packaged_path(&anchored, &inner);
+            }
+            return asset_path.to_string();
+        }
+
         let path = Path::new(asset_path);
 
         // Absolute paths are their own identifier.
@@ -290,8 +310,25 @@ impl Resolver for DefaultResolver {
             return canonical_identifier(path.to_path_buf());
         }
 
-        // Anchor relative paths to the anchor's directory.
+        // Anchor relative paths.
         if let Some(anchor) = anchor {
+            let anchor_str = anchor.to_string_lossy();
+            // Anchor lives inside a package (`pkg.usdz[inner/layer.usd]`): keep
+            // the reference inside the package, relative to the inner layer's
+            // directory → `pkg.usdz[inner/asset.usd]`.
+            if is_package_relative_path(&anchor_str) {
+                if let Some((package, inner)) = split_package_relative_path_inner(&anchor_str) {
+                    let inner_dir = inner.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+                    let joined = join_packaged_path(inner_dir, asset_path);
+                    return nest_packaged_path(&package, &joined);
+                }
+            }
+            // Anchor IS a package file (`foo.usdz`): a relative reference from
+            // the package's root layer is package-relative → `foo.usdz[asset]`.
+            if anchor_str.to_ascii_lowercase().ends_with(".usdz") {
+                let joined = join_packaged_path("", asset_path);
+                return join_package_relative_path(&anchor_str, &joined);
+            }
             if let Some(dir) = anchor.parent() {
                 return canonical_identifier(dir.join(path));
             }
@@ -311,13 +348,19 @@ impl Resolver for DefaultResolver {
             return None;
         }
 
-        // Handle package-relative paths.
+        // A package-relative path (`pkg.usdz[inner]`) resolves its outer package
+        // as a plain file, then reattaches the inner packaged path. The inner
+        // entry must actually exist in the archive: a path to a missing entry is
+        // unresolved, not merely unreadable, so the caller reports it as such
+        // rather than as a malformed layer.
         if is_package_relative_path(asset_path) {
             let (package, inner) = split_package_relative_path_outer(asset_path)?;
-            let resolved_package = self.resolve(&package)?;
-            // Return the resolved package with the inner path reattached.
-            let package_str = resolved_package.to_str().unwrap_or_default();
-            return Some(ResolvedPath::new(join_package_relative_path(package_str, &inner)));
+            let resolved_package = self.resolve_with_search_paths(&package)?;
+            if !package_contains(&resolved_package, &inner) {
+                return None;
+            }
+            let package_str = resolved_package.to_string_lossy();
+            return Some(ResolvedPath::new(join_package_relative_path(&package_str, &inner)));
         }
 
         self.resolve_with_search_paths(asset_path)
@@ -364,8 +407,7 @@ impl Resolver for DefaultResolver {
                 )
             })?;
 
-            let package_file = fs::File::open(&package)?;
-            let mut archive = zip::ZipArchive::new(package_file).map_err(io::Error::other)?;
+            let mut archive = open_package_archive(Path::new(&package))?;
             let mut entry = archive.by_name(&inner).map_err(io::Error::other)?;
 
             let mut buffer = Vec::new();
@@ -418,6 +460,42 @@ fn normalize_search_path(path: PathBuf) -> PathBuf {
         path
     };
     lexically_normalize(&path)
+}
+
+/// Opens `package` as a ZIP archive, reading only its central directory.
+///
+/// Shared by [`DefaultResolver::open_asset`], which then extracts an entry, and
+/// [`package_contains`], which only checks an entry's presence.
+fn open_package_archive(package: &Path) -> io::Result<zip::ZipArchive<fs::File>> {
+    let file = fs::File::open(package)?;
+    zip::ZipArchive::new(file).map_err(io::Error::other)
+}
+
+/// Whether `inner` should be treated as present in the package at `package`.
+///
+/// Reading only the archive's central directory — not its entry data — a
+/// readable archive that genuinely lacks a flat entry reports it absent, so
+/// [`DefaultResolver::resolve`] reports a missing inner layer as unresolved
+/// rather than as a layer that exists but cannot be read. Two cases are
+/// deliberately treated as present so the eventual open surfaces the accurate
+/// error instead of a misleading "missing asset": a `package` that cannot be
+/// opened right now (a transient IO error or a corrupt archive — distinct from
+/// a genuinely absent entry), and a nested packaged path
+/// (`inner.usdz[deep.usd]`, which is not a flat entry name and whose support is
+/// decided when the inner package opens).
+///
+/// TODO(perf): opens the package's central directory on every package-relative
+/// resolve (per in-package arc, re-run each composition pass). Cache parsed
+/// central directories keyed by resolved package path so repeated probes and
+/// the eventual load share one parse.
+fn package_contains(package: &Path, inner: &str) -> bool {
+    if is_package_relative_path(inner) {
+        return true;
+    }
+    match open_package_archive(package) {
+        Ok(mut archive) => archive.by_name(inner).is_ok(),
+        Err(_) => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +585,44 @@ pub fn split_package_relative_path_inner(path: &str) -> Option<(String, String)>
 /// ```
 pub fn join_package_relative_path(package_path: &str, packaged_path: &str) -> String {
     format!("{}[{}]", package_path, packaged_path)
+}
+
+/// Joins a package-internal directory with a relative reference authored inside
+/// it, producing the entry name a packaged layer is stored under.
+///
+/// Package entry names are always `/`-separated and carry no filesystem
+/// semantics, so unlike [`lexically_normalize`] this collapses `..` as well as
+/// `.` and always emits forward slashes — the spelling
+/// [`zip::ZipArchive::by_name`] matches against. `dir` is the directory of the
+/// anchoring inner layer (empty for a layer at the package root); `rel` is the
+/// relative path it references. A `..` that would climb above the package root
+/// is dropped, since there is nothing above it inside the archive.
+fn join_packaged_path(dir: &str, rel: &str) -> String {
+    let mut components: Vec<&str> = dir.split('/').filter(|c| !c.is_empty()).collect();
+    for part in rel.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    components.join("/")
+}
+
+/// Attaches `leaf` as a packaged layer inside the deepest package of `base`.
+///
+/// For a plain `base` this is [`join_package_relative_path`]. When `base` is
+/// itself package-relative — its outer package holds a nested package — the
+/// `leaf` is nested into the innermost bracket so the result stays well-formed
+/// (`pkg[inner[leaf]]`) rather than gaining a stray second bracket pair
+/// (`pkg[inner][leaf]`), which no split or resolve step can interpret.
+fn nest_packaged_path(base: &str, leaf: &str) -> String {
+    match split_package_relative_path_outer(base) {
+        Some((package, inner)) => join_package_relative_path(&package, &nest_packaged_path(&inner, leaf)),
+        None => join_package_relative_path(base, leaf),
+    }
 }
 
 #[cfg(test)]
@@ -715,6 +831,59 @@ mod tests {
             resolver.create_identifier("./sub.usda", Some(&anchor)),
             resolver.create_identifier("sub.usda", Some(&anchor)),
             "a leading `./` normalizes away when the target cannot be canonicalized"
+        );
+    }
+
+    #[test]
+    fn resolver_create_identifier_package_relative_anchored() {
+        let resolver = DefaultResolver::new();
+        let anchor = ResolvedPath::new(PathBuf::from("/scene/root.usda"));
+        // A package-relative target anchors its outer package path to the
+        // anchor's directory (not returned verbatim), then reattaches the inner
+        // packaged path — the same identifier as anchoring the bare package.
+        assert_eq!(
+            resolver.create_identifier("model.usdz[geom.usd]", Some(&anchor)),
+            join_package_relative_path(&resolver.create_identifier("model.usdz", Some(&anchor)), "geom.usd"),
+        );
+    }
+
+    #[test]
+    fn packaged_path_join_forward_slash() {
+        // Package entry names are `/`-separated regardless of host platform, and
+        // `.`/`..` collapse since there is no filesystem inside the archive.
+        assert_eq!(join_packaged_path("geom", "mesh.usd"), "geom/mesh.usd");
+        assert_eq!(join_packaged_path("geom", "./mesh.usd"), "geom/mesh.usd");
+        assert_eq!(join_packaged_path("geom", "../tex/foo.usda"), "tex/foo.usda");
+        assert_eq!(join_packaged_path("", "geom/mesh.usd"), "geom/mesh.usd");
+        // A back-slash spelling is normalized to forward slashes.
+        assert_eq!(join_packaged_path("geom", r"sub\mesh.usd"), "geom/sub/mesh.usd");
+    }
+
+    #[test]
+    fn in_package_anchor_crosses_dirs() {
+        let resolver = DefaultResolver::new();
+        // A reference authored in a sub-directory layer that climbs out of it
+        // resolves to a forward-slash, `..`-collapsed entry name — the spelling
+        // the archive is keyed by — not a host path with separators or `..`.
+        let anchor = ResolvedPath::new(PathBuf::from("pkg.usdz[geom/scene.usda]"));
+        assert_eq!(
+            resolver.create_identifier("../tex/foo.usda", Some(&anchor)),
+            "pkg.usdz[tex/foo.usda]",
+        );
+    }
+
+    #[test]
+    fn nest_packaged_well_formed() {
+        // A leaf nests into the innermost package rather than appending a stray
+        // second bracket pair.
+        assert_eq!(nest_packaged_path("pkg.usdz", "geom.usd"), "pkg.usdz[geom.usd]");
+        assert_eq!(
+            nest_packaged_path("pkg.usdz[model.usdz]", "geom.usd"),
+            "pkg.usdz[model.usdz[geom.usd]]",
+        );
+        assert_eq!(
+            nest_packaged_path("a.usdz[b.usdz[c.usdz]]", "d.usd"),
+            "a.usdz[b.usdz[c.usdz[d.usd]]]",
         );
     }
 

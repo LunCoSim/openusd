@@ -93,12 +93,6 @@ bitflags! {
         const INERT = 1 << 0;
         /// Hidden from value resolution but retained for change tracking.
         const CULLED = 1 << 1;
-        /// Subtree namespace-restricted by a relocate.
-        const RESTRICTED = 1 << 2;
-        /// Blocked by `permission = private` on a stronger site.
-        const PERMISSION_DENIED = 1 << 3;
-        /// This site is itself `permission = private`.
-        const PERMISSION_PRIVATE = 1 << 4;
         /// Children are prohibited (e.g. an unloaded payload).
         const PROHIBITED_CHILDREN = 1 << 5;
         /// Added by implied inherit/specialize propagation.
@@ -362,14 +356,6 @@ impl Node {
     pub(crate) fn is_relocate_source(&self) -> bool {
         self.flags.contains(NodeFlags::RELOCATE_SOURCE)
     }
-
-    /// True when this node is a direct arc to a `permission = private` site, or
-    /// lies in such an arc's subtree (spec 10.3.3). It stays visible
-    /// structurally (`nodes`, `has_spec`, child names) but contributes no
-    /// opinions to value resolution — the C++ `_InertSubtree` behavior.
-    pub(crate) fn is_permission_denied(&self) -> bool {
-        self.flags.contains(NodeFlags::PERMISSION_DENIED)
-    }
 }
 
 /// One contributing prim spec in a [`PrimIndex`](crate::pcp::PrimIndex)'s
@@ -424,6 +410,16 @@ pub(crate) struct PrimIndexGraph {
     /// layer-muting drop). This serves the recomposition fanout; the skipped arc is
     /// separately surfaced as an [`Error::MutedAssetPath`](super::Error::MutedAssetPath).
     pub(crate) muted_external_targets: Vec<LayerId>,
+    /// Canonical identifiers of reference/payload targets a composition arc
+    /// resolved to but skipped because the target was muted *before it was ever
+    /// loaded* — the target has no interned [`LayerId`], so
+    /// [`muted_external_targets`](Self::muted_external_targets) cannot record it.
+    /// The identifier is the one the muted set matched (C++ `Pcp_MutedLayers`), so
+    /// unmuting that same canonical identifier fans the invalidation back to this
+    /// index even though its arc grafted no node and its target was never interned.
+    /// Like `muted_external_targets`, the skipped arc is separately surfaced as an
+    /// [`Error::MutedAssetPath`](super::Error::MutedAssetPath).
+    pub(crate) muted_unloaded_targets: Vec<String>,
 }
 
 impl PrimIndexGraph {

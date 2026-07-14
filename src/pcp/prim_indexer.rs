@@ -221,6 +221,16 @@ struct Frame<'f> {
     /// introduces, inherited from the arc that spawned it (C++ `_AddArc`'s
     /// `skipDuplicateNodes`). The top-level build has no frame and never skips.
     skip: bool,
+    /// The fully composed expression variables visible at the site where the
+    /// arc that spawned this sub-build was discovered — not this frame's own
+    /// authored variables, but the outer ambient context.
+    /// [`Indexer::composed_expr_vars`] overlays this once its own graph's
+    /// node→root walk is exhausted, so a reference or payload authored on an
+    /// ancestor composed inside this sub-build's own nested recursion still
+    /// sees the outer overrides. This value is already fully resolved
+    /// through any further-outer frames (each nesting level applies the same
+    /// fallback), so one level here suffices for arbitrarily deep nesting.
+    ambient_expr_vars: &'f HashMap<String, Value>,
     /// The next parent frame, or `None` at the top-level build.
     previous: Option<&'f Frame<'f>>,
 }
@@ -379,7 +389,8 @@ pub(crate) struct BuildOutput {
 
 /// The shared, read-only inputs to a prim build — the same across every nested
 /// sub-build (C++ `PcpPrimIndexInputs` plus the `PcpCache` it reads). All
-/// borrows, so it is `Copy` and threads into a sub-build unchanged.
+/// borrows or `Copy` values, so it is `Copy` and threads into a sub-build
+/// unchanged.
 #[derive(Clone, Copy)]
 struct Inputs<'a> {
     /// The layer stack being composed.
@@ -391,6 +402,10 @@ struct Inputs<'a> {
     /// is read from here to seed this child's graph (C++
     /// `_BuildInitialPrimIndexFromAncestor`).
     cached_indices: &'a sdf::PathTable<PrimEntry>,
+    /// Whether payload arcs are expanded during composition — the per-path
+    /// decision for the site being built (`IndexCache::is_loaded`), not
+    /// something `ctx` carries, since a sibling prim can resolve differently.
+    load_payloads: bool,
 }
 
 /// The site this build composes (C++ `PcpLayerStackSite`): the layer stack the
@@ -469,12 +484,14 @@ impl<'a, 'f> Indexer<'a, 'f> {
         ctx: &'a CompositionContext,
         cached_indices: &'a sdf::PathTable<PrimEntry>,
         ambient: LayerStackId,
+        load_payloads: bool,
     ) -> Self {
         Self {
             inputs: Inputs {
                 stack,
                 ctx,
                 cached_indices,
+                load_payloads,
             },
             site: Site {
                 ambient,
@@ -738,7 +755,13 @@ impl<'a, 'f> Indexer<'a, 'f> {
         frame: Option<&'g Frame<'g>>,
         root_contributes: bool,
     ) -> Indexer<'a, 'g> {
-        let mut sub = Indexer::new(self.inputs.stack, self.inputs.ctx, self.inputs.cached_indices, ambient);
+        let mut sub = Indexer::new(
+            self.inputs.stack,
+            self.inputs.ctx,
+            self.inputs.cached_indices,
+            ambient,
+            self.inputs.load_payloads,
+        );
         sub.frame = frame;
         sub.frame_depth = self.frame_depth + 1;
         sub.root_contributes = root_contributes;
@@ -769,6 +792,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
         skip: bool,
         root_contributes: bool,
         arc: ArcType,
+        ambient_expr_vars: &HashMap<String, Value>,
     ) -> BuildResult<BuildOutput> {
         let requested_layer = self.inputs.stack.layer_stack_root(ambient);
         let frame = Frame {
@@ -778,6 +802,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
             arc,
             requested_layer,
             skip,
+            ambient_expr_vars,
             previous: self.frame,
         };
         self.new_sub(ambient, Some(&frame), root_contributes).build(target)
@@ -792,11 +817,16 @@ impl<'a, 'f> Indexer<'a, 'f> {
         // `None` (the sub-build was itself left incomplete by the missing layer).
         self.pending_loads.extend(out.pending_loads);
         // A muted target reached only inside the sub-build is still a dependency
-        // of this prim, so carry its trace up before the graph is grafted.
+        // of this prim, so carry its trace up before the graph is grafted — both
+        // the loaded-but-empty targets (by `LayerId`) and the never-loaded ones (by
+        // canonical identifier).
         if let Some(graph) = &out.graph {
             self.output
                 .muted_external_targets
                 .extend(graph.muted_external_targets.iter().copied());
+            self.output
+                .muted_unloaded_targets
+                .extend(graph.muted_unloaded_targets.iter().cloned());
         }
         out.graph
     }
@@ -820,8 +850,11 @@ impl<'a, 'f> Indexer<'a, 'f> {
         map: MapFunction,
         origin: NodeId,
         sibling: u16,
+        ambient_expr_vars: &HashMap<String, Value>,
     ) -> BuildResult<Option<NodeId>> {
-        let Some(sub) = self.merge_subindex(self.compose_subindex(target, ambient, skip, true, arc)?) else {
+        let Some(sub) =
+            self.merge_subindex(self.compose_subindex(target, ambient, skip, true, arc, ambient_expr_vars)?)
+        else {
             return Ok(None);
         };
         let Some(grafted) = self.graft_subindex(&sub, parent, arc, map, origin, sibling) else {
@@ -985,7 +1018,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
     /// [`add_tasks_for_node`](Self::add_tasks_for_node) when an arc is composed.
     fn add_expressed_arc_tasks(&mut self, node: NodeId) {
         self.tasks.push(Task::new(TaskKind::EvalNodeReferences, node));
-        if self.inputs.ctx.load_payloads {
+        if self.inputs.load_payloads {
             self.tasks.push(Task::new(TaskKind::EvalNodePayloads, node));
         }
         self.tasks.push(Task::new(TaskKind::EvalNodeInherits, node));
@@ -1165,9 +1198,9 @@ impl<'a, 'f> Indexer<'a, 'f> {
     fn eval_node_relocations(&mut self, node: NodeId) -> BuildResult<()> {
         {
             let n = self.node(node);
-            // C++ `CanContributeSpecs`: not inert/culled/permission-denied. A
-            // spec-less node still relocates, so `has_specs` is not required.
-            if n.is_inert() || n.is_culled() || n.is_permission_denied() {
+            // C++ `CanContributeSpecs`: not inert/culled. A spec-less node still
+            // relocates, so `has_specs` is not required.
+            if n.is_inert() || n.is_culled() {
                 return Ok(());
             }
         }
@@ -1222,12 +1255,14 @@ impl<'a, 'f> Indexer<'a, 'f> {
         // the target). Its root is salted-earth inert; opinions and implied
         // classes carried up across the relocate node translate the source
         // namespace to the target.
+        let expr_vars = self.composed_expr_vars(node);
         let Some(sub) = self.merge_subindex(self.compose_subindex(
             &source,
             node_ambient,
             self.frame_skip(),
             false,
             ArcType::Relocate,
+            &expr_vars,
         )?) else {
             return Ok(());
         };
@@ -1539,11 +1574,13 @@ impl<'a, 'f> Indexer<'a, 'f> {
     /// `PrimIndex::composed_expr_vars` is the value-resolution-time twin of this
     /// walk over the finished index; keep the two in sync.
     ///
-    /// TODO(expr-arcs): a reference authored inside a sub-root arc target is
-    /// composed in a nested sub-build whose graph holds only the target's
-    /// subtree, so this walk stops at the sub-build root and misses the outer
-    /// frames' overrides. Thread the variables across the [`Frame`] chain to
-    /// cover that case.
+    /// A sub-root arc target is composed in a nested sub-build whose graph
+    /// holds only the target's own subtree, so the node→root walk stops at
+    /// the sub-build's local root without reaching the outer frames' own
+    /// overrides; once exhausted, the walk falls back to the spawning
+    /// [`Frame`]'s already-resolved ambient, which wins as the closer-to-root
+    /// opinion (recorded on [`Frame::ambient_expr_vars`] when the sub-build
+    /// was spawned).
     ///
     /// TODO(perf): this runs per reference/payload eval task and reads each
     /// boundary layer's `expressionVariables` even when no asset path is an
@@ -1561,20 +1598,26 @@ impl<'a, 'f> Indexer<'a, 'f> {
             }
             cur = n.parent;
         }
+        // This build's own graph is disjoint from the outer frame until
+        // grafted; the frame's ambient is already resolved as of the point the
+        // arc that spawned this sub-build fired, so it overrides anything
+        // found within this subtree.
+        if let Some(frame) = self.frame {
+            expr::compose_over(&mut composed, frame.ambient_expr_vars);
+        }
         composed
     }
 
     /// Reads the `expressionVariables` authored by a layer stack's own layers,
     /// composing them across the stack with the strongest member winning.
     fn layer_stack_expr_vars(&self, ambient: LayerStackId) -> HashMap<String, Value> {
-        let mut vars = HashMap::new();
-        // Members are strongest-first; apply weakest-first so the strongest wins.
-        for &(layer, _) in self.inputs.stack.layer_stack(ambient).iter().rev() {
-            if let Ok(dict) = expr::read_expression_variables(self.inputs.stack.layer(layer).data()) {
-                expr::compose_over(&mut vars, &dict);
-            }
-        }
-        vars
+        expr::compose_layer_variables(
+            self.inputs
+                .stack
+                .layer_stack(ambient)
+                .iter()
+                .map(|&(layer, _)| self.inputs.stack.layer(layer).data()),
+        )
     }
 
     /// Composes the class-based arcs (inherits or specializes) authored at
@@ -1983,6 +2026,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
         if skip && self.find_duplicate(stack_id, &var_path) {
             return Ok(());
         }
+        let expr_vars = self.composed_expr_vars(node);
         let grafted = self.compose_and_graft(
             &var_path,
             stack_id,
@@ -1992,6 +2036,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
             map,
             node,
             vt.vset_num,
+            &expr_vars,
         )?;
         if grafted.is_some() {
             self.retry_variant_tasks();
@@ -2159,6 +2204,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
         // A sub-root class needs the opinions above it: compose the target as its
         // own ancestral sub-index and graft it under the parent.
         if direct_should && !inherit_path.is_root_prim() {
+            let expr_vars = self.composed_expr_vars(parent);
             let grafted = self.compose_and_graft(
                 &inherit_path,
                 parent_stack,
@@ -2168,6 +2214,7 @@ impl<'a, 'f> Indexer<'a, 'f> {
                 inherit_map,
                 origin,
                 arc_num,
+                &expr_vars,
             )?;
             if implied {
                 if let Some(g) = grafted {
@@ -2490,7 +2537,18 @@ impl<'a, 'f> Indexer<'a, 'f> {
         // A sub-root specialize target needs the opinions above it (C++
         // `includeAncestralOpinions = !IsRootPrimPath`).
         if !src_path.is_root_prim() {
-            return self.compose_and_graft(&src_path, src_stack, true, root, ArcType::Specialize, map, src, sibling);
+            let expr_vars = self.composed_expr_vars(src);
+            return self.compose_and_graft(
+                &src_path,
+                src_stack,
+                true,
+                root,
+                ArcType::Specialize,
+                map,
+                src,
+                sibling,
+                &expr_vars,
+            );
         }
 
         let has_specs = self.stack_has_spec(src_stack, &src_path);
@@ -2566,36 +2624,18 @@ impl<'a, 'f> Indexer<'a, 'f> {
         } else {
             let layer_index = match self.inputs.stack.id_of(asset_path) {
                 Some(layer_index) => layer_index,
-                // The target is not loaded. The authoring layer's location gates
-                // both the `.usdz` guard and the relative-mute anchor, so resolve
-                // it once here — only on a lookup miss, leaving an already-loaded
-                // arc (the steady state) doing no filesystem work.
+                // The target is not loaded.
                 None => {
-                    // TODO(perf): this resolves the authoring layer's location
-                    // only to read its extension for the usdz guard; the layer's
-                    // in-memory identifier already carries the extension, so the
-                    // guard could test that and skip the filesystem resolve.
-                    let anchor = self.inputs.stack.anchor_location(Some(self.node(parent).layer_id()));
-                    // A reference/payload authored inside a `.usdz` package would
-                    // need to open a sibling layer within the archive, which is not
-                    // yet supported (the eager collector bailed the same way for a
-                    // usdz inner layer's sublayers). Report it explicitly rather
-                    // than letting the package-relative target fail as a generic
-                    // unresolved layer.
-                    if anchor.as_ref().is_some_and(|resolved| resolved.extension() == "usdz") {
-                        self.errors.push(Error::UnsupportedUsdzReference {
-                            asset_path: asset_path.to_string(),
-                            arc,
-                            introduced_by: self.introducing_layer(parent),
-                            site_path: parent_path,
-                        });
-                        return Ok(());
-                    }
                     // A muted target contributes nothing and is never opened: drop
-                    // the arc (it then composes as if absent) and record the muted
-                    // reference as a diagnostic. Checked before the load demand so a
-                    // muted target's file is not read.
-                    if self.arc_target_muted(parent, asset_path) {
+                    // the arc (it then composes as if absent) and record both the
+                    // muted reference as a diagnostic and the matched canonical
+                    // identifier as the dependency trace an unmute fans out through
+                    // (the target never interns, so there is no `LayerId` to key on,
+                    // unlike a loaded target whose muted root empties its stack).
+                    // Checked before the load demand so a muted target's file is not
+                    // read.
+                    if let Some(canonical) = self.arc_target_muted(parent, asset_path) {
+                        self.output.muted_unloaded_targets.push(canonical);
                         self.errors.push(Error::MutedAssetPath {
                             asset_path: asset_path.to_string(),
                             arc,
@@ -2762,8 +2802,17 @@ impl<'a, 'f> Indexer<'a, 'f> {
         // `PcpErrorUnresolvedPrimPath`).
         if !source.is_root_prim() {
             let before = self.errors.len();
-            let grafted =
-                self.compose_and_graft(&source, target_stack, self.frame_skip(), parent, arc, map, parent, 0)?;
+            let grafted = self.compose_and_graft(
+                &source,
+                target_stack,
+                self.frame_skip(),
+                parent,
+                arc,
+                map,
+                parent,
+                0,
+                expr_vars,
+            )?;
             // The target is unresolved only when composing it hit a cycle (its own
             // ancestral chain loops back) that left nothing — not when it is merely
             // empty so far (e.g. a variant supplies its opinions later).
@@ -2847,9 +2896,9 @@ impl<'a, 'f> Indexer<'a, 'f> {
         self.inputs.stack.layer(self.node(node).layer_id()).identifier.clone()
     }
 
-    /// Whether the reference/payload target `asset_path` names a muted layer,
-    /// matched by the canonical identifier it would be interned under. A reference
-    /// may be authored on any member of `node`'s layer stack — a sublayer in a
+    /// The canonical identifier the muted set matched for the reference/payload
+    /// target `asset_path`, or `None` when it names no muted layer. A reference may
+    /// be authored on any member of `node`'s layer stack — a sublayer in a
     /// different directory than the node's representative — so the target is
     /// canonicalized against each member's location and looked up in the muted set
     /// (C++ `_EvalRefOrPayloadArcs` checks the specific authoring `srcLayer`). The
@@ -2858,18 +2907,24 @@ impl<'a, 'f> Indexer<'a, 'f> {
     /// identifier. Guarded by [`has_muted_layers`](LayerGraph::has_muted_layers) so
     /// the common unmuted stage does no anchoring work.
     ///
+    /// The returned identifier is the muted-set entry an unmute toggles, so a
+    /// not-yet-loaded target records it (`muted_unloaded_targets`) as the trace an
+    /// unmute fans out through — it never interns, so there is no `LayerId` to key on.
+    ///
     /// TODO(perf): on a muted stage this resolves each member's anchor and
     /// canonicalizes `asset_path` against it (a filesystem syscall apiece) for
     /// every not-yet-loaded reference/payload arc. Cache the per-member anchors, or
     /// track the specific authoring layer per arc entry so only one canonicalize
     /// runs (the `srcLayer` C++ uses).
-    fn arc_target_muted(&self, node: NodeId, asset_path: &str) -> bool {
+    fn arc_target_muted(&self, node: NodeId, asset_path: &str) -> Option<String> {
         let graph = self.inputs.stack;
-        graph.has_muted_layers()
-            && graph
-                .layer_stack(self.node(node).layer_stack_id())
-                .iter()
-                .any(|&(layer, _)| graph.is_asset_muted(asset_path, graph.anchor_location(Some(layer)).as_ref()))
+        if !graph.has_muted_layers() {
+            return None;
+        }
+        graph
+            .layer_stack(self.node(node).layer_stack_id())
+            .iter()
+            .find_map(|&(layer, _)| graph.muted_asset_id(asset_path, graph.anchor_location(Some(layer)).as_ref()))
     }
 
     /// Builds the cycle chain for an [`Error::ArcCycle`]: the arcs from the
@@ -3159,7 +3214,7 @@ mod tests {
     fn build(stack: &LayerGraph, prim: &str) -> Option<PrimIndexGraph> {
         let ctx = CompositionContext::default();
         let ambient = stack.root_layer_stack_id();
-        Indexer::new(stack, &ctx, &sdf::PathTable::new(), ambient)
+        Indexer::new(stack, &ctx, &sdf::PathTable::new(), ambient, true)
             .build(&Path::from(prim))
             .expect("indexer build")
             .graph
@@ -3295,6 +3350,42 @@ mod tests {
         );
     }
 
+    /// A reference authored on an ancestor of a sub-root reference target is
+    /// composed inside that target's own nested `Indexer` sub-build spawned by
+    /// `compose_and_graft`'s `Frame`; the outer (referencing) layer's `TARGET`
+    /// must win over the target file's own `TARGET`.
+    #[test]
+    fn expr_vars_subroot_frame() {
+        let s = multi_stack(&[
+            (
+                "root.usd",
+                "#usda 1.0\n(\n    expressionVariables = {\n        string TARGET = \"right.usd\"\n    }\n)\ndef \"Model\" (\n    references = @mid.usd@</Sub/Prim>\n) {}\n",
+            ),
+            (
+                "mid.usd",
+                "#usda 1.0\n(\n    expressionVariables = {\n        string TARGET = \"wrong.usd\"\n    }\n)\ndef \"Sub\" (\n    references = @`${TARGET}`@\n) {}\n",
+            ),
+            (
+                "right.usd",
+                "#usda 1.0\n(\n    defaultPrim = \"Right\"\n)\ndef \"Right\" {\n    def \"Prim\" { custom string source = \"right\" }\n}\n",
+            ),
+            (
+                "wrong.usd",
+                "#usda 1.0\n(\n    defaultPrim = \"Wrong\"\n)\ndef \"Wrong\" {\n    def \"Prim\" { custom string source = \"wrong\" }\n}\n",
+            ),
+        ]);
+        let graph =
+            build(&s, "/Model").expect("a sub-root reference whose ancestor authors an expr-var reference is composed");
+        let right_id = s.id_of("right.usd").expect("right.usd present");
+        assert!(
+            graph.iter().any(|n| n.layer_id() == right_id && n.has_specs()),
+            "the outer layer's TARGET=\"right.usd\" must win over mid.usd's own \
+             TARGET=\"wrong.usd\" when Sub's ancestral reference is resolved \
+             inside the nested sub-root build, got {:?}",
+            graph.iter().map(|n| (n.arc, n.path.as_str())).collect::<Vec<_>>()
+        );
+    }
+
     /// A class brought in through a reference is mirrored into the referencing
     /// namespace as an implied class node, so an outer opinion on the class
     /// contributes (C++ `_EvalImpliedClassTree`).
@@ -3385,9 +3476,10 @@ mod tests {
                 index: root_index,
                 context: CompositionContext::default(),
                 errors: Vec::new(),
+                resolved_targets: Default::default(),
             },
         );
-        let child = Indexer::new(&s, &ctx, &cached, ambient)
+        let child = Indexer::new(&s, &ctx, &cached, ambient, true)
             .build(&Path::from("/Root/Child"))
             .expect("indexer build")
             .graph

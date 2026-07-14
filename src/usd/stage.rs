@@ -39,6 +39,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::rc::{Rc, Weak};
 
 use anyhow::Result;
@@ -48,7 +49,7 @@ use crate::tf::Token;
 use crate::{ar, pcp, sdf};
 
 use super::interp::{self, InterpolationType};
-use super::sink::{Payload, Provenance, StageSink, StageSinkId};
+use super::sink::{Payload, PendingChange, Provenance, StageSink, StageSinkId};
 
 bitflags! {
     /// Resolved stage-level status bits for a prim.
@@ -174,11 +175,17 @@ pub enum InitialLoadSet {
     LoadNone,
 }
 
-impl InitialLoadSet {
-    /// Returns `true` when payload arcs should be followed.
-    pub const fn load_payloads(self) -> bool {
-        matches!(self, Self::LoadAll)
-    }
+/// How deeply a [`Stage::load`] call expands payloads. Mirrors C++
+/// `UsdLoadPolicy`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPolicy {
+    /// Load the requested prim, its ancestors, and every descendant payload
+    /// recursively. C++ `UsdLoadWithDescendants`.
+    #[default]
+    WithDescendants,
+    /// Load only the requested prim (and its ancestors); a descendant with
+    /// no rule of its own is excluded. C++ `UsdLoadWithoutDescendants`.
+    WithoutDescendants,
 }
 
 /// Population mask limiting which prim paths are exposed by a [`Stage`].
@@ -634,6 +641,11 @@ impl From<sdf::EditError> for StageAuthoringError {
     }
 }
 
+/// One committed layer edit queued in [`StageInner::pending`]: the transaction id
+/// it committed under (for grouping the drain), the edited layer, its change
+/// record, and the [`Provenance`] staged for it (`None` for a direct edit).
+type PendingEdit = (u64, pcp::LayerId, sdf::ChangeList, Option<Provenance>);
+
 /// Shared state behind a [`Stage`] handle.
 ///
 /// Owns the loaded layer stack and the composed-scene state. Composition
@@ -679,7 +691,9 @@ pub struct StageInner {
     sinks: RefCell<sdf::sink::Set<dyn StageSink>>,
     /// Layer edits recorded by each layer's aggregator sink (installed by
     /// [`add_layer`](Stage::add_layer)), awaiting composed processing by
-    /// [`process_pending`](Stage::process_pending). Each entry carries its
+    /// [`process_pending`](Stage::process_pending). Each entry carries the
+    /// transaction id it committed under (so the drain groups a transaction's
+    /// layers together, from [`current_generation`](Self::current_generation)) and its
     /// [`Provenance`], or `None` when no stage authoring method staged one — a
     /// direct [`layer_mut`](Stage::layer_mut) edit, resolved against local-layer
     /// membership when the queue drains.
@@ -704,12 +718,21 @@ pub struct StageInner {
     ///   borrow held; the callback can't tell, so it records uniformly and the
     ///   recompose happens on the next composed read (drain-on-read). Stage-routed
     ///   and raw layer edits flow through the identical path.
-    pending: RefCell<Vec<(pcp::LayerId, sdf::ChangeList, Option<Provenance>)>>,
+    pending: RefCell<Vec<PendingEdit>>,
     /// The [`Provenance`] a stage authoring method publishes for the commit
     /// currently underway, read by the aggregator as it records into
     /// [`pending`](Self::pending). `None` for a direct edit, which the drain
     /// resolves from local-layer membership.
     edit_provenance: RefCell<Option<Provenance>>,
+    /// The transaction id of the layer commit currently draining, cached from its
+    /// [`PendingLayerChange`](sdf::PendingLayerChange) by the aggregator's
+    /// `before_commit` so the matching `after_commit`
+    /// ([`record_pending`](Stage::record_pending)) can stamp it onto the queued
+    /// edit, which [`process_pending`](Stage::process_pending) then groups by. The
+    /// id is minted once per atomic transaction by `sdf::edit_layers`, so a
+    /// stage-authored batch and a direct [`layer_mut`](Stage::layer_mut) edit are
+    /// each one transaction without the stage tracking any boundary of its own.
+    current_generation: Cell<u64>,
 }
 
 /// A composed USD stage.
@@ -759,6 +782,38 @@ impl Drop for ClearEditProvenance<'_> {
     }
 }
 
+/// The [`sdf::LayerSink`] a [`Stage`] installs on every layer it owns (through
+/// [`add_layer`](Stage::add_layer)) to bridge the low tier of the change
+/// pipeline to the high tier: it records each commit into
+/// [`pending`](StageInner::pending) for a composed recompose, and forwards the
+/// staged pre-commit edit to the stage's [`StageSink`]s. It holds a
+/// [`WeakStage`] so it forms no reference cycle (the stage owns the layer, which
+/// owns this sink).
+struct StageAggregator {
+    stage: WeakStage,
+    layer_id: pcp::LayerId,
+}
+
+impl sdf::LayerSink for StageAggregator {
+    fn before_commit(&self, change: &sdf::PendingLayerChange<'_>) -> Result<(), sdf::sink::Error> {
+        if let Some(stage) = self.stage.upgrade() {
+            // Cache this transaction's id (minted by `sdf::edit_layers`) for the
+            // matching `after_commit`'s `record_pending` to read; `before_commit`
+            // fires for a layer before its `after_commit`, and every layer of a
+            // transaction shares one id, so the cache is correct for each.
+            stage.current_generation.set(change.generation);
+            stage.forward_before_commit(change);
+        }
+        Ok(())
+    }
+
+    fn after_commit(&self, _layer: &str, changes: &sdf::ChangeList) {
+        if let Some(stage) = self.stage.upgrade() {
+            stage.record_pending(self.layer_id, changes.clone());
+        }
+    }
+}
+
 impl Stage {
     /// Opens a stage from a root layer file using the [`ar::DefaultResolver`].
     ///
@@ -789,9 +844,41 @@ impl Stage {
     /// cache's per-prim build errors. Prim indices are built lazily, so the
     /// per-prim half is a snapshot of errors discovered by stage queries
     /// performed so far.
+    ///
+    /// A muted branch's missing/unreadable sublayer, which the loader recorded raw,
+    /// is filtered out here against the current composed state — the referring layer
+    /// contributes nothing, or the sublayer itself is muted — so muting suppresses
+    /// the diagnostic and unmuting restores it, without the one-shot error ever
+    /// being discarded.
     pub fn composition_errors(&self) -> Vec<pcp::Error> {
-        let mut errors = self.layers().errors();
-        errors.extend(self.cache().composition_errors());
+        // Drain pending edits once, then take both borrows directly: routing through
+        // the `layers()`/`cache()` accessors would each re-run `process_pending`, and
+        // holding the graph borrow across the second run risks a re-entrant
+        // borrow-mut if a sink re-queues an edit during notification.
+        self.process_pending();
+        let graph = self.layers.borrow();
+        let mut errors = graph.errors();
+        let cache_errors = self.cache.borrow().composition_errors();
+        // Only a muted stage suppresses anything, and only sublayer diagnostics; skip
+        // building the effective-layer set when there is nothing to filter.
+        if !graph.has_muted_layers() || !cache_errors.iter().any(is_sublayer_error) {
+            errors.extend(cache_errors);
+            return errors;
+        }
+        // The effectively-composed layers: every composed stack's members (the root
+        // stack and each interned reference/payload target stack), which muting has
+        // pruned muted subtrees from. This is a pure function of the muted set and
+        // the graph, so a diagnostic's visibility is deterministic and does not
+        // flicker with cache warmth. A still-interned target whose only arc became
+        // muted keeps its diagnostic — a deliberate conservative over-report (see the
+        // pcp "Muted sublayer diagnostics" remaining-work note), chosen over hiding a
+        // valid error because an unrelated invalidation evicted the proving index.
+        let effective = graph.effective_layers();
+        errors.extend(
+            cache_errors
+                .into_iter()
+                .filter(|error| graph.sublayer_error_contributes(error, &effective)),
+        );
         errors
     }
 
@@ -1176,6 +1263,15 @@ impl Stage {
         self.with_stage_metadata_layer(|layer| layer.set_frames_per_second(rate))
     }
 
+    /// Authors `expressionVariables` on the current edit target's layer when it
+    /// is the root or session layer (see [`Self::with_stage_metadata_layer`]).
+    /// The dictionary supplies the values `${VAR}` expressions in sublayer asset
+    /// paths and reference/payload targets resolve against; replacing it
+    /// recomposes every prim whose composition reads the edited layer stack.
+    pub fn set_expression_variables(&self, vars: HashMap<String, sdf::Value>) -> Result<(), StageAuthoringError> {
+        self.with_stage_metadata_layer(|layer| layer.set_expression_variables(vars))
+    }
+
     /// Map `scene_path` through the current edit target, borrow the target's
     /// layer, and hand both the layer and the mapped spec path to `f`, then
     /// drive cache invalidation from the [`sdf::ChangeList`] the closure
@@ -1447,18 +1543,45 @@ impl Stage {
     /// [`WeakStage`], so it does not form a reference cycle (the stage owns the
     /// layer, which owns the sink).
     fn add_layer(&self, layer: sdf::Layer) -> (pcp::LayerId, bool) {
-        let stage = self.downgrade();
         let mut layers = self.layers.borrow_mut();
         let (id, fresh) = layers.ensure_layer(layer);
         if fresh {
             let node = layers.get_mut(id).expect("just-interned layer is live");
-            node.layer.add_sink(move |_: &str, changes: &sdf::ChangeList| {
-                if let Some(stage) = stage.upgrade() {
-                    stage.record_pending(id, changes.clone());
-                }
+            node.layer.add_sink(StageAggregator {
+                stage: self.downgrade(),
+                layer_id: id,
             });
         }
         (id, fresh)
+    }
+
+    /// Fan out a layer's staged pre-commit edit to the installed
+    /// [`StageSink`]s' [`before_commit`](StageSink::before_commit), bridging one
+    /// [`sdf::PendingLayerChange`] to the stage-tier [`PendingChange`]. Called by
+    /// the [`StageAggregator`] from inside the layer's commit seam, while the
+    /// layer graph is borrowed for the edit — so it reads only
+    /// [`sinks`](StageInner::sinks) and [`edit_provenance`](StageInner::edit_provenance),
+    /// never the graph or cache. A no-op when no sink is installed.
+    fn forward_before_commit(&self, change: &sdf::PendingLayerChange<'_>) {
+        let sinks = self.sinks.borrow();
+        if sinks.is_empty() {
+            return;
+        }
+        // Borrow the provenance's mapping into the event rather than cloning it: a
+        // `before_commit` sink observes and must not re-enter authoring (which is
+        // what would re-borrow `edit_provenance`), so holding the borrow across the
+        // fan-out is safe and avoids a per-commit `MapFunction` clone.
+        let provenance = self.edit_provenance.borrow();
+        let pending = PendingChange {
+            layer_identifier: change.layer_identifier,
+            base: change.base,
+            change_list: change.change_list,
+            mapping: provenance.as_ref().and_then(|p| p.mapping()),
+            generation: change.generation,
+        };
+        for sink in sinks.iter() {
+            sink.before_commit(self, &pending);
+        }
     }
 
     /// Record a committed layer edit for [`process_pending`](Self::process_pending),
@@ -1470,7 +1593,9 @@ impl Stage {
     /// [`pending`](StageInner::pending) cell rather than recomposing inline.
     pub(super) fn record_pending(&self, layer_id: pcp::LayerId, changes: sdf::ChangeList) {
         let provenance = self.edit_provenance.take();
-        self.pending.borrow_mut().push((layer_id, changes, provenance));
+        self.pending
+            .borrow_mut()
+            .push((self.current_generation.get(), layer_id, changes, provenance));
     }
 
     /// Drain the layer edits recorded by the aggregators and drive one composition
@@ -1494,48 +1619,51 @@ impl Stage {
         if self.layers.borrow_mut().clear_failed_loads() {
             self.cache.borrow_mut().drop_load_failed_indices();
         }
-        // A single edit carries its own provenance: a staged one verbatim, or an
-        // unstaged edit (`None`) resolved to `LocalStack` or `DirectLayerEdit` by
-        // whether the edited layer is in the local layer stack — a linear scan of
-        // the (small) root stack, run only for that case. A batch records many,
-        // all from one transaction sharing one published provenance carried by the
-        // first committed layer's record: a mapped relocate batch authors every
-        // stack layer in the target's namespace, so that `EditTarget` provenance
-        // translates the merged change's paths, while a local-stack batch stages
-        // none and reports `LocalStack` (its layers share the stage namespace).
-        // Several distinct provenances are only reachable by interleaving a raw
-        // layer edit with a targeted one; there the dependency-derived composed
-        // paths stay correct and only the literal-path translation drops.
-        let provenance = if drained.len() == 1 {
-            let id = drained[0].0;
-            drained[0].2.take().unwrap_or_else(|| {
-                if self
+        // Entries committed under one transaction id are contiguous — a
+        // transaction's layers record together, and the id increases across
+        // transactions — so grouping by adjacent equal id carves the queue into
+        // per-transaction groups. Each group applies as its own composed change,
+        // so unrelated edits (a direct `layer_mut` commit sitting pending when the
+        // next stage edit lands) stay separate rather than merging into one event.
+        for group in drained.chunk_by_mut(|a, b| a.0 == b.0) {
+            let generation = group[0].0;
+            let provenance = self.resolve_group_provenance(group);
+            let edits: Vec<(pcp::LayerId, &sdf::ChangeList)> =
+                group.iter().map(|(_, id, changes, _)| (*id, changes)).collect();
+            self.apply_change_sets(generation, &edits, &provenance);
+        }
+    }
+
+    /// The [`Provenance`] for one transaction's group of recorded edits. A staged
+    /// provenance (published by a stage authoring method) rides the first layer
+    /// the transaction committed; an unstaged direct edit resolves from
+    /// local-layer membership — [`Provenance::LocalStack`] when the edited layer
+    /// is in the root layer stack (its paths are stage paths), else
+    /// [`Provenance::DirectLayerEdit`]. A multi-layer group with no staged
+    /// provenance is a local-stack batch (its layers share the stage namespace).
+    fn resolve_group_provenance(&self, group: &mut [PendingEdit]) -> Provenance {
+        if let Some(provenance) = group.iter_mut().find_map(|(_, _, _, provenance)| provenance.take()) {
+            return provenance;
+        }
+        match group {
+            [(_, id, _, _)]
+                if !self
                     .layers
                     .borrow()
                     .root_layer_stack()
                     .iter()
-                    .any(|&(lid, _)| lid == id)
-                {
-                    Provenance::LocalStack
-                } else {
-                    Provenance::DirectLayerEdit
-                }
-            })
-        } else {
-            drained
-                .iter_mut()
-                .find_map(|(_, _, provenance)| provenance.take())
-                .unwrap_or(Provenance::LocalStack)
-        };
-        let edits: Vec<(pcp::LayerId, &sdf::ChangeList)> =
-            drained.iter().map(|(id, changes, _)| (*id, changes)).collect();
-        self.apply_change_sets(&edits, &provenance);
+                    .any(|&(lid, _)| lid == *id) =>
+            {
+                Provenance::DirectLayerEdit
+            }
+            _ => Provenance::LocalStack,
+        }
     }
 
-    /// Classify a batch of committed [`sdf::ChangeList`]s — one per edited layer
-    /// — through a single [`pcp::Changes`] cycle and apply the resulting cache
-    /// invalidation, delivering one [`CommittedChange`](super::CommittedChange)
-    /// for the whole batch to the installed sinks.
+    /// Classify one transaction's committed [`sdf::ChangeList`]s — one per edited
+    /// layer — through a single [`pcp::Changes`] cycle and apply the resulting
+    /// cache invalidation, delivering one [`CommittedChange`](super::CommittedChange)
+    /// (tagged with the transaction `generation`) to the installed sinks.
     ///
     /// [`pcp::Changes::did_change`] takes the per-layer split because
     /// classification is layer-relative; the event instead reports the merged
@@ -1543,7 +1671,7 @@ impl Stage {
     /// records' layer-namespace paths reach stage namespace — a batched namespace
     /// edit is [`Provenance::LocalStack`], the local layer stack sharing the
     /// stage's namespace.
-    fn apply_change_sets(&self, edits: &[(pcp::LayerId, &sdf::ChangeList)], provenance: &Provenance) {
+    fn apply_change_sets(&self, generation: u64, edits: &[(pcp::LayerId, &sdf::ChangeList)], provenance: &Provenance) {
         let mut pcp_changes = pcp::Changes::new();
         {
             let cache = self.cache.borrow();
@@ -1551,21 +1679,21 @@ impl Stage {
         }
         // Snapshot the after-commit payload before `apply` consumes
         // `pcp_changes`, and only when a sink is installed — the no-sink path
-        // stays allocation-free. The per-layer records merge into one list for
-        // the event, which reads paths in the (here identical) stage namespace.
-        //
-        // TODO(namespace-edit): merging discards per-layer provenance — the event
-        // carries one layer identifier (the strongest edited layer), so a sink
-        // reading the raw change list per layer mis-attributes records that
-        // landed in a sublayer. Carrying the per-layer records on the event (or
-        // one event per layer) would let a multi-layer namespace edit replicate
-        // faithfully.
+        // stays allocation-free. The event carries both the merged change list
+        // (the union, keyed to the strongest layer) and the per-layer records
+        // ([`layer_changes`]), so a sink deriving a per-layer diff reads each
+        // layer's own record rather than mis-reading a sublayer's change against
+        // the strongest layer's data.
         let payload = (!self.sinks.borrow().is_empty()).then(|| {
+            let layer_changes: Vec<(String, sdf::ChangeList)> = edits
+                .iter()
+                .map(|(id, changes)| (self.layer_identifier(*id).unwrap_or_default(), (*changes).clone()))
+                .collect();
             let mut merged = sdf::ChangeList::new();
             for (_, changes) in edits {
                 merged.merge_from(changes);
             }
-            Payload::new(&pcp_changes, &merged, provenance)
+            Payload::new(&pcp_changes, &merged, layer_changes, provenance)
         });
         {
             let mut graph = self.layers.borrow_mut();
@@ -1578,7 +1706,7 @@ impl Stage {
                 .first()
                 .and_then(|(id, _)| self.layer_identifier(*id))
                 .unwrap_or_default();
-            let change = payload.committed_change(&layer_identifier, provenance);
+            let change = payload.committed_change(&layer_identifier, provenance, generation);
             for sink in self.sinks.borrow().iter() {
                 sink.after_commit(self, &change);
             }
@@ -1789,6 +1917,232 @@ impl Stage {
         }
     }
 
+    /// Loads `path`'s payload — and its ancestors', if not already loaded —
+    /// per `policy` (C++ `UsdStage::Load`). Loading an already-loaded path is
+    /// legal and simply costs nothing (see [`load_rules`](Self::load_rules)'s
+    /// no-op guarantee). `path` need not currently resolve to a composed
+    /// prim — only an ancestor need exist — since loading a not-yet-visible
+    /// descendant is the common case.
+    ///
+    /// A `path` that normalizes into a `/__Prototype_N` prototype's namespace
+    /// is silently ignored, mirroring [`mute_layer`](Self::mute_layer)'s
+    /// treatment of the root layer: load rules are always authored in
+    /// real-namespace terms, and a rule on a synthetic prototype path would
+    /// never be consulted. No inactive-ancestor validation is performed — an
+    /// inactive subtree never composes regardless of its load rule, so a rule
+    /// authored there is inert but harmless.
+    pub fn load(&self, path: impl Into<sdf::Path>, policy: LoadPolicy) {
+        let Some(path) = self.normalize_load_target(path.into()) else {
+            return;
+        };
+        let victims = self.install_load_rules(|rules| match policy {
+            LoadPolicy::WithDescendants => rules.load_with_descendants(path.clone()),
+            LoadPolicy::WithoutDescendants => rules.load_without_descendants(path.clone()),
+        });
+        self.notify_load_rules_changed(&victims);
+    }
+
+    /// Unloads `path`'s payload and everything beneath it (C++
+    /// `UsdStage::Unload`). Same leniency as [`load`](Self::load) for a
+    /// prototype-namespace path.
+    pub fn unload(&self, path: impl Into<sdf::Path>) {
+        let Some(path) = self.normalize_load_target(path.into()) else {
+            return;
+        };
+        let victims = self.install_load_rules(|rules| rules.unload(path.clone()));
+        self.notify_load_rules_changed(&victims);
+    }
+
+    /// Loads every path in `to_load` (with `policy`) and unloads every path
+    /// in `to_unload`, applying every edit to one clone of the rules and
+    /// recomposing once for the whole batch (C++ `UsdStage::LoadAndUnload`).
+    /// Every `to_unload` path is applied before
+    /// any `to_load` path, matching C++'s own "unloads first, then loads" —
+    /// so a path in both sets ends up loaded, and unloading an ancestor while
+    /// loading one of its descendants in the same call still leaves the
+    /// descendant reachable (the ancestor resolves to
+    /// [`pcp::Rule::Only`](crate::pcp::Rule::Only), not excluded, via
+    /// [`pcp::LoadRules::effective_rule`]'s lookahead).
+    pub fn load_and_unload(
+        &self,
+        to_load: impl IntoIterator<Item = (impl Into<sdf::Path>, LoadPolicy)>,
+        to_unload: impl IntoIterator<Item = impl Into<sdf::Path>>,
+    ) {
+        let to_unload: Vec<sdf::Path> = to_unload
+            .into_iter()
+            .filter_map(|path| self.normalize_load_target(path.into()))
+            .collect();
+        let to_load: Vec<(sdf::Path, LoadPolicy)> = to_load
+            .into_iter()
+            .filter_map(|(path, policy)| self.normalize_load_target(path.into()).map(|path| (path, policy)))
+            .collect();
+        let victims = self.install_load_rules(|rules| {
+            for path in to_unload {
+                rules.unload(path);
+            }
+            for (path, policy) in to_load {
+                match policy {
+                    LoadPolicy::WithDescendants => rules.load_with_descendants(path),
+                    LoadPolicy::WithoutDescendants => rules.load_without_descendants(path),
+                }
+            }
+        });
+        self.notify_load_rules_changed(&victims);
+    }
+
+    /// A clone of the stage's current load rules (C++
+    /// `UsdStage::GetLoadRules`).
+    pub fn load_rules(&self) -> pcp::LoadRules {
+        self.cache().load_rules().clone()
+    }
+
+    /// Replaces the stage's load rules wholesale, recomposing every cached
+    /// index the change could affect (C++ `UsdStage::SetLoadRules`) — the
+    /// same bounded invalidation [`load`](Self::load)/[`unload`](Self::unload)
+    /// use, not a blunt whole-stage drop, since the affected set is already
+    /// provably sufficient (see [`pcp::LoadRules`]'s module documentation).
+    pub fn set_load_rules(&self, rules: pcp::LoadRules) {
+        let victims = self.replace_load_rules(rules);
+        self.notify_load_rules_changed(&victims);
+    }
+
+    /// Every prim below `root` (inclusive) that carries a payload arc, loaded
+    /// or not, excluding inactive prims (C++ `UsdStage::FindLoadable`).
+    ///
+    /// Discovering a payload nested several levels deep requires actually
+    /// reading its target layer — there is no way to know a layer's content
+    /// without loading it — so this call transiently installs
+    /// [`pcp::LoadRules::all`] to make every payload discoverable, walks the
+    /// tree, and then restores the stage's original load rules. Neither swap
+    /// fires [`StageSink::load_rules_changed`], and [`load_rules`](Self::load_rules)
+    /// reads back the original table afterward, so the *rules* are not
+    /// observable — but if `root`'s current rules are not already the
+    /// all-inclusive default, each swap can still evict cached prim indices
+    /// and bump the composition revision (matching whatever `set_load_rules`
+    /// would do for that same transition), which a cached value view keyed
+    /// on the revision will notice.
+    ///
+    /// This also has a real, permanent side effect worth calling out: every
+    /// payload-target layer under `root` is left loaded in the layer
+    /// registry afterward, even though the load *rules* are restored — this
+    /// codebase has no layer-eviction mechanism yet, so there is no way to
+    /// discover a payload's content without leaving its layer resident.
+    /// C++'s own `FindLoadable` equally must traverse (and thus compose)
+    /// every candidate subtree.
+    // TODO(perf): when the stage's current rules are not already
+    // `LoadRules::all()`, the install and the restore each evict the whole
+    // store (the root rule itself changes), so a stage opened with
+    // `InitialLoadSet::LoadNone` pays two full-store recomposes per call. A
+    // scratch cache the walk composes into, left uncommitted, would avoid
+    // this, but is a larger change than this method currently needs.
+    pub fn find_loadable(&self, root: impl Into<sdf::Path>) -> anyhow::Result<Vec<sdf::Path>> {
+        let root = root.into();
+        let _guard = LoadRulesGuard {
+            stage: self,
+            original: self.load_rules(),
+        };
+        self.replace_load_rules(pcp::LoadRules::all());
+        let mut found = Vec::new();
+        self.walk_loadable(&root, &mut found)?;
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
+
+    /// Every prim currently included by the load rules — i.e. carrying a
+    /// payload arc whose own rule currently resolves loaded (C++
+    /// `UsdStage::GetLoadSet`). Unlike [`load_rules`](Self::load_rules), this
+    /// reports the actual composed state, not the raw authored rules.
+    pub fn load_set(&self) -> anyhow::Result<Vec<sdf::Path>> {
+        Ok(self
+            .find_loadable(sdf::Path::abs_root())?
+            .into_iter()
+            .filter(|path| self.is_path_loaded(path))
+            .collect())
+    }
+
+    /// Collects every active, payload-carrying prim at or below `path` into
+    /// `found` — the walk behind [`find_loadable`](Self::find_loadable). An
+    /// explicit work stack, not native recursion, so a pathologically deep
+    /// prim hierarchy cannot overflow the call stack — matching
+    /// [`traverse`](Self::traverse)'s own approach to the same style of
+    /// whole-tree walk.
+    fn walk_loadable(&self, path: &sdf::Path, found: &mut Vec<sdf::Path>) -> anyhow::Result<()> {
+        let mut stack = vec![path.clone()];
+        while let Some(path) = stack.pop() {
+            let prim = self.prim(path.clone());
+            if !prim.is_active()? {
+                continue;
+            }
+            if super::prim::has_payload(self, &path)? {
+                found.push(path.clone());
+            }
+            for child in prim.children()? {
+                stack.push(child.path().clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Reduces `path` to an absolute prim path (`prim_path` strips a property
+    /// suffix and `strip_all_variant_selections` collapses any variant
+    /// segment — [`pcp::LoadRules`]' table requires genuinely prim-only
+    /// paths), then rejects a path inside a `/__Prototype_N` namespace, where
+    /// load rules are never consulted (see [`pcp::LoadRules`]'s instancing
+    /// notes). A cheap early exit for `load`/`unload`/`load_and_unload` — the
+    /// real enforcement of the same invariant lives in
+    /// `IndexCache::set_load_rules`, the single choke point every mutation
+    /// (including a caller-supplied [`set_load_rules`](Self::set_load_rules)
+    /// table this normalization never sees) passes through.
+    fn normalize_load_target(&self, path: sdf::Path) -> Option<sdf::Path> {
+        let path = sdf::Path::abs_root().make_absolute(&path.prim_path().strip_all_variant_selections());
+        let cache = self.cache();
+        if cache.is_prototype(&path) || cache.is_in_prototype(&path) {
+            return None;
+        }
+        Some(path)
+    }
+
+    /// Applies `edit` to a clone of the stage's current load rules and
+    /// installs the result, returning the bounded set of paths whose cached
+    /// index was dropped (empty for a no-op edit). For `load`/`unload`/
+    /// `load_and_unload`, which build on the existing table.
+    fn install_load_rules(&self, edit: impl FnOnce(&mut pcp::LoadRules)) -> Vec<sdf::Path> {
+        let mut rules = self.cache.borrow().load_rules().clone();
+        edit(&mut rules);
+        self.replace_load_rules(rules)
+    }
+
+    /// Installs `rules` directly in place of the stage's current load rules,
+    /// returning the bounded set of paths whose cached index was dropped. The
+    /// entry point for callers that already hold the exact replacement
+    /// value: [`set_load_rules`](Self::set_load_rules) and the transient
+    /// swaps in [`find_loadable`](Self::find_loadable)/[`LoadRulesGuard`].
+    fn replace_load_rules(&self, rules: pcp::LoadRules) -> Vec<sdf::Path> {
+        // Drain pending edits first so the mutation recomposes against a
+        // current graph and cache, matching `apply_mute`.
+        self.process_pending();
+        self.cache.borrow_mut().set_load_rules(rules)
+    }
+
+    /// Fires [`StageSink::load_rules_changed`] with the resynced paths, after
+    /// the cache borrow is released — skipped entirely when `resynced` is
+    /// empty (a no-op edit invalidated nothing).
+    fn notify_load_rules_changed(&self, resynced: &[sdf::Path]) {
+        if resynced.is_empty() {
+            return;
+        }
+        for sink in self.sinks.borrow().iter() {
+            sink.load_rules_changed(self, resynced);
+        }
+    }
+
+    /// `true` if `path`'s own payload is included by the stage's load rules —
+    /// the per-ancestor check behind [`Prim::is_loaded`](super::Prim::is_loaded).
+    pub(crate) fn is_path_loaded(&self, path: &sdf::Path) -> bool {
+        self.cache().is_loaded(path)
+    }
+
     /// Applies a muted-set mutation to the layer graph and recomposes when it
     /// reports a change, returning the canonical identifier whose muted state
     /// toggled (`None` when the set was unchanged). Unmuting through an alternate
@@ -1806,8 +2160,22 @@ impl Stage {
         let mut cache = self.cache.borrow_mut();
         let change = mutate(&mut graph)?;
         // The mutation already rebuilt the graph's sublayer stacks, relocates, and
-        // cycle diagnostics; only the cache needs work.
-        cache.invalidate_layers(&graph, &change.affected);
+        // cycle diagnostics; only the cache needs work. Removing a session variable
+        // drops the root `${VAR}` sublayer it selected — the graph re-resolves the
+        // already-interned layer out of the stack. Dropping the affected indices by
+        // both the toggled layer's fanout and its canonical identifier reaches a
+        // referrer that skipped this target while it was muted-and-never-loaded, so
+        // unmuting recomposes it and the load barrier finally opens the target.
+        //
+        // Runtime session-variable changes that newly *select* an unopened root
+        // `${VAR}` sublayer — a mute exposing the root's own variable, or a session
+        // `expressionVariables` edit (which reaches the cache through the change
+        // pipeline, not here) — do not load it: they resolve root sublayers only
+        // against already-interned layers. The open-time builder path loads the
+        // initial selection (see `StageBuilder::session_expression_variables`);
+        // reloading a newly-selected root sublayer at runtime would need an on-demand
+        // sublayer open through the graph, left as remaining work.
+        cache.invalidate_muting(&change.affected, &change.changed);
         Some(change.changed)
     }
 
@@ -1829,8 +2197,10 @@ impl Stage {
         self.layers().muted_layers()
     }
 
-    /// Returns the stage's initial payload loading behavior.
-    pub fn load(&self) -> InitialLoadSet {
+    /// Returns the stage's initial payload loading behavior, as requested at
+    /// open time (`StageBuilder::load`). The live, runtime-mutable policy is
+    /// [`load_rules`](Self::load_rules).
+    pub fn initial_load_set(&self) -> InitialLoadSet {
         self.initial_load_set
     }
 
@@ -2526,8 +2896,7 @@ impl Stage {
             // composed against its stack; drop their cached indices so they
             // recompose with the relocates applied.
             if !relocated.is_empty() {
-                let graph = self.layers.borrow();
-                self.cache.borrow_mut().invalidate_layers(&graph, &relocated);
+                self.cache.borrow_mut().invalidate_layers(&relocated);
             }
         }
         // Mint each demand's layer stack now that the edges are wired. The layer
@@ -2591,6 +2960,21 @@ impl Stage {
     }
 }
 
+/// Restores a stage's load rules on drop — the RAII half of
+/// [`Stage::find_loadable`]'s transient `LoadRules::all()` swap, so the
+/// original rules are reinstalled even if the walk between construction and
+/// drop returns early on error.
+struct LoadRulesGuard<'a> {
+    stage: &'a Stage,
+    original: pcp::LoadRules,
+}
+
+impl Drop for LoadRulesGuard<'_> {
+    fn drop(&mut self) {
+        self.stage.replace_load_rules(mem::take(&mut self.original));
+    }
+}
+
 /// Builder for configuring and opening a [`Stage`].
 ///
 /// Created via [`Stage::builder`]. Configures the [`LayerRegistry`] layers load
@@ -2609,6 +2993,15 @@ pub struct StageBuilder {
 struct CollectedLayers {
     layers: Vec<sdf::Layer>,
     errors: Vec<pcp::Error>,
+}
+
+/// Whether a composition error is a sublayer load diagnostic — the only kind
+/// [`Stage::composition_errors`] filters against the muted-aware effective set.
+fn is_sublayer_error(error: &pcp::Error) -> bool {
+    matches!(
+        error,
+        pcp::Error::UnresolvedSublayer { .. } | pcp::Error::MalformedSublayer { .. }
+    )
 }
 
 impl StageBuilder {
@@ -2739,7 +3132,13 @@ impl StageBuilder {
     /// so they hold the strongest opinions.
     pub fn open(self, root_path: &str) -> Result<Stage> {
         let session = self.collect_optional_session_layers()?;
-        let root = self.collect_layers(root_path)?;
+        // Seed the root collection with the session layers' composed expression
+        // variables (muted ones excluded): the session is part of the root layer
+        // stack, so a `${VAR}` root sublayer the session resolves must be loaded
+        // here — composition later resolves it against the same variables but can
+        // only intern a layer this collection opened.
+        let session_vars = self.session_expression_variables(root_path, &session.layers);
+        let root = self.collect_layers(root_path, &session_vars)?;
         let session_layer_count = session.layers.len();
         let layers = session.layers.into_iter().chain(root.layers).collect();
         let errors = session.errors.into_iter().chain(root.errors).collect();
@@ -2781,14 +3180,18 @@ impl StageBuilder {
     /// mask prunes them naturally: a culled prim is never composed, so its arc
     /// targets are never demanded. A missing sublayer is recorded as an
     /// [`UnresolvedSublayer`](pcp::Error::UnresolvedSublayer) collection error
-    /// rather than aborting the open.
-    fn collect_layers(&self, path: &str) -> Result<CollectedLayers> {
+    /// rather than aborting the open; one under a muted branch is filtered out
+    /// later, once the muted-aware graph exists (see
+    /// [`StageBuilder::make_stage`](Self::make_stage)).
+    fn collect_layers(&self, path: &str, ancestor_expr_vars: &HashMap<String, sdf::Value>) -> Result<CollectedLayers> {
         let errors = RefCell::new(Vec::new());
-        // The root stack has no referrer, so no inherited expression variables.
+        // `ancestor_expr_vars` are the expression variables the enclosing context
+        // contributes: the session layers' composed set for the root stack, empty
+        // for the session stack itself (nothing sublayers it).
         let layers = self.registry.open_stack(
             path,
             None,
-            &HashMap::new(),
+            ancestor_expr_vars,
             false,
             &|error| {
                 errors.borrow_mut().push(error.into());
@@ -2805,9 +3208,87 @@ impl StageBuilder {
     /// Collect the configured session layer (and its dependencies), if any.
     fn collect_optional_session_layers(&self) -> Result<CollectedLayers> {
         match self.session_layer.as_deref() {
-            Some(p) => self.collect_layers(p),
+            Some(p) => self.collect_layers(p, &HashMap::new()),
             None => Ok(CollectedLayers::default()),
         }
+    }
+
+    /// The builder's requested mutes, canonicalized against the root layer the way
+    /// the graph's muted set is (C++ `Pcp_MutedLayers::_GetCanonicalLayerId`): with
+    /// a resolvable root anchor each spelling is resolved to the identifier its
+    /// layer interns under, so any spelling of one layer collapses to one entry; an
+    /// in-memory or anonymous root has no anchor, so the spelling passes through.
+    /// Lets collection test a sublayer's interned identifier for muting before the
+    /// graph exists. Empty when nothing is muted.
+    fn canonical_muted_set(&self, root_path: &str) -> HashSet<String> {
+        if self.muted.is_empty() {
+            return HashSet::new();
+        }
+        let root_anchor = self
+            .registry
+            .resolve_layer(&self.registry.create_identifier(root_path, None));
+        self.muted
+            .iter()
+            .map(|m| match root_anchor.as_ref() {
+                Some(a) => self.registry.create_identifier(m, Some(a)),
+                None => m.clone(),
+            })
+            .collect()
+    }
+
+    /// The composed expression variables of the *effective* session stack — the
+    /// collected session layers minus any muted layer and the whole subtree it
+    /// sublayers. A muted session opinion must not select the root's `${VAR}`
+    /// sublayers, matching the graph's muted-aware resolution once the stage is
+    /// built (the graph would otherwise re-resolve the sublayer to one this
+    /// collection never opened). Pruning uses the shared
+    /// [`muted_subtree`](pcp::muted_subtree) rule the graph applies over its
+    /// resolved edges, walked here over the collected layers' authored sublayer
+    /// paths so the two agree on the effective stack. Mutes and sublayer paths are
+    /// canonicalized against the root / their layer the way the interned
+    /// identifiers were, so any spelling of a muted layer is excluded. Expression-
+    /// valued session sublayers are evaluated with the variables inherited from
+    /// their session ancestors.
+    fn session_expression_variables(
+        &self,
+        root_path: &str,
+        session_layers: &[sdf::Layer],
+    ) -> HashMap<String, sdf::Value> {
+        if self.muted.is_empty() {
+            return sdf::expr::compose_layer_variables(session_layers.iter().map(|l| l.data()));
+        }
+        let muted = self.canonical_muted_set(root_path);
+        let mut scope = HashSet::new();
+        for layer in session_layers {
+            scope.insert(layer.identifier().to_string());
+        }
+        let mut contexts: HashMap<String, HashMap<String, sdf::Value>> = HashMap::new();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for layer in session_layers {
+            let inherited = contexts.get(layer.identifier()).cloned().unwrap_or_default();
+            let mut vars = sdf::expr::read_expression_variables(layer.data())
+                .map(|vars| vars.into_owned())
+                .unwrap_or_default();
+            sdf::expr::compose_over(&mut vars, &inherited);
+            let layer_children: Vec<String> = sdf::LayerRegistry::sublayer_paths(layer.data())
+                .iter()
+                .filter_map(|sub| sdf::expr::evaluate_asset_path(sub, &vars).ok())
+                .map(|sub| self.registry.create_identifier_anchored(&sub, layer.real_path()))
+                .collect();
+            for child in &layer_children {
+                contexts.entry(child.clone()).or_insert_with(|| vars.clone());
+            }
+            children.insert(layer.identifier().to_string(), layer_children);
+        }
+        let pruned = pcp::muted_subtree(&scope, scope.iter().filter(|id| muted.contains(*id)).cloned(), |id| {
+            children.get(id).cloned().unwrap_or_default()
+        });
+        sdf::expr::compose_layer_variables(
+            session_layers
+                .iter()
+                .filter(|l| !pruned.contains(l.identifier()))
+                .map(|l| l.data()),
+        )
     }
 
     /// Assemble a [`Stage`] from already-collected layers. Shared
@@ -2821,7 +3302,10 @@ impl StageBuilder {
         session_layer_count: usize,
         collection_errors: Vec<pcp::Error>,
     ) -> Stage {
-        let load_payloads = self.initial_load_set.load_payloads();
+        let load_rules = match self.initial_load_set {
+            InitialLoadSet::LoadAll => pcp::LoadRules::all(),
+            InitialLoadSet::LoadNone => pcp::LoadRules::none(),
+        };
         // The root layer stack's identity, from the collected inputs: the root is
         // the first non-session layer, the session layer the first of any. The
         // graph below is populated layer by layer, so this is read from the inputs
@@ -2847,7 +3331,7 @@ impl StageBuilder {
             layers: RefCell::new(pcp::LayerGraph::new(self.registry)),
             cache: RefCell::new(pcp::IndexCache::new(
                 self.variant_fallbacks,
-                load_payloads,
+                load_rules,
                 collection_errors,
             )),
             initial_load_set: self.initial_load_set,
@@ -2858,6 +3342,7 @@ impl StageBuilder {
             sinks: RefCell::default(),
             pending: RefCell::new(Vec::new()),
             edit_provenance: RefCell::new(None),
+            current_generation: Cell::new(0),
         }));
         // Add every collected layer through the one join seam, so each gets its
         // change aggregator as it joins; then wire the sublayer DAG from the
@@ -2881,13 +3366,22 @@ impl StageBuilder {
             // Seed the graph's muted set (it drops any root-layer request and
             // re-resolves identifiers on each later rebuild). The cache is still
             // empty (composition is lazy), so no cache invalidation is needed yet.
-            // TODO: a missing sublayer under a muted layer was already recorded as
-            // an `UnresolvedSublayer` collection error before this seeding, so
-            // `composition_errors` still reports a muted branch. Apply the muted
-            // set during collection to suppress those.
+            // The raw collection diagnostics stay as the loader recorded them; the
+            // muted ones are filtered out at report time (`Stage::composition_errors`)
+            // against the current composed state, so an unmute restores a diagnostic
+            // a muted branch had hidden.
             stage.layers.borrow_mut().set_muted_identifiers(self.muted);
         }
         stage
+    }
+}
+
+#[cfg(test)]
+impl Stage {
+    /// The number of installed [`StageSink`]s, for tests asserting a wrapper's
+    /// recording sink is installed and later removed.
+    pub(crate) fn sink_count(&self) -> usize {
+        self.sinks.borrow().iter().count()
     }
 }
 
@@ -3863,14 +4357,13 @@ def "T" {
         Ok(())
     }
 
-    /// Pins the resolved-members prong of the cache's mute fanout. A prim whose
-    /// only opinion lives in a sublayer of the root composes into a single local
-    /// node on the stage Root layer stack, whose frozen `representative` is the
-    /// strongest session layer. Muting that sublayer fans out to `{sublayer,
-    /// root}` — not the session layer — so the representative is not in the
-    /// affected set; the index is dropped only because the node's resolved
-    /// members still list the (surviving) root layer. A regression to a
-    /// representative-only check would leave this index stale.
+    /// A prim whose only opinion lives in a sublayer of the root composes into a
+    /// single local node on the stage Root layer stack, which the reverse
+    /// `layer → indices` map registers under every member layer the node spans
+    /// (`session`, `root`, and the `child` sublayer). Muting `child` fans out to
+    /// `{child, root}`, so the index is found through its `child` registration
+    /// even though the stack's strongest member is the unaffected session layer.
+    /// Registering only the stack's strongest member would leave this index stale.
     #[test]
     fn mute_sublayer_drops_root_stack_index() -> Result<()> {
         let session = sdf::Layer::new_in_memory("session.usda");
@@ -3884,7 +4377,7 @@ def "T" {
         });
 
         // session at index 0, root + its `child` sublayer after: /P's Root node
-        // spans [session, root, child], so its representative is the session layer.
+        // spans [session, root, child].
         let stage = Stage::builder().make_stage(vec![session, root, child], 1, Vec::new());
         let p = sdf::path("/P")?;
         assert!(stage.prim(p.clone()).is_valid()?);
@@ -3893,7 +4386,7 @@ def "T" {
         stage.mute_layer("child.usda");
         assert!(
             !stage.is_indexed(&p),
-            "muting the root sublayer holding /P's opinion drops the cached index via the members prong"
+            "muting the root sublayer holding /P's opinion drops the cached index"
         );
         Ok(())
     }
@@ -4091,6 +4584,73 @@ def "T" {
         assert_eq!(
             after, fresh,
             "editing timeCodesPerSecond recomposes the sublayer offset to the fresh-open value"
+        );
+        Ok(())
+    }
+
+    /// Editing the root layer's `expressionVariables` re-expands a `${VAR}`
+    /// sublayer asset path, so the cached prim index recomposes against the newly
+    /// named sublayer — the correctness gap the expression-variable invalidation
+    /// closes (a stale read before the fix).
+    #[test]
+    fn expr_var_edit_recomposes_sublayer() -> Result<()> {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            let mut pr = e.pseudo_root_mut().unwrap();
+            pr.set_expression_variables(HashMap::from([("WHICH".to_string(), sdf::Value::String("a".into()))]));
+            pr.set_sublayers([r#"`"${WHICH}.usda"`"#]);
+        });
+        let stage = Stage::builder().make_stage(
+            vec![root, opinion_layer("a.usda", 1.0)?, opinion_layer("b.usda", 2.0)?],
+            0,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            stage.attribute("/A.x").get::<f64>()?,
+            Some(1.0),
+            "the WHICH-valued sublayer resolves to a.usda"
+        );
+        stage.set_expression_variables(HashMap::from([("WHICH".to_string(), sdf::Value::String("b".into()))]))?;
+        assert_eq!(
+            stage.attribute("/A.x").get::<f64>()?,
+            Some(2.0),
+            "editing WHICH re-expands the sublayer to b.usda and recomposes the cached index"
+        );
+        Ok(())
+    }
+
+    /// A `${VAR}` sublayer in the root layer resolves against an expression
+    /// variable authored on the *session* layer: the session is part of the root
+    /// layer stack, so its variables seed the root's sublayer expansion — the same
+    /// composition a `${VAR}` reference already gets.
+    #[test]
+    fn session_var_resolves_sublayer() -> Result<()> {
+        let mut session = sdf::Layer::new_in_memory("session.usda");
+        edit_layer(&mut session, |e| {
+            e.pseudo_root_mut()
+                .unwrap()
+                .set_expression_variables(HashMap::from([("WHICH".to_string(), sdf::Value::String("a".into()))]));
+        });
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${WHICH}.usda"`"#]);
+        });
+        let stage = Stage::builder().make_stage(
+            vec![
+                session,
+                root,
+                opinion_layer("a.usda", 1.0)?,
+                opinion_layer("b.usda", 2.0)?,
+            ],
+            1,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            stage.attribute("/A.x").get::<f64>()?,
+            Some(1.0),
+            "the root sublayer expression resolves against the session layer's WHICH variable"
         );
         Ok(())
     }
@@ -4294,6 +4854,37 @@ def "T" {
         assert!(changed);
         assert!(stage.prim(sdf::path("/FromRoot")?).is_valid()?);
         assert!(stage.prim(sdf::path("/FromWeak")?).is_valid()?);
+        Ok(())
+    }
+
+    /// A `ReplayStage` records a multi-layer `batch_edit` as one forward diff per
+    /// layer, reading each layer's own change against its own data — so a spec
+    /// authored only in the weaker layer is captured, not masked by the strongest
+    /// layer holding no such spec.
+    #[test]
+    fn replay_multi_layer_batch() -> Result<()> {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["weak.usda"]);
+        });
+        let stage = Stage::builder().make_stage(vec![root, opinion_layer("weak.usda", 1.0)?], 0, Vec::new());
+        let recorder = crate::usd::ReplayStage::from(stage);
+        recorder.batch_edit(&["root.usda", "weak.usda"], |edits| {
+            sdf::PrimSpec::new(edits[0].data_mut(), "/FromRoot", sdf::Specifier::Def, "")?;
+            sdf::PrimSpec::new(edits[1].data_mut(), "/FromWeak", sdf::Specifier::Def, "")?;
+            Ok(())
+        })?;
+
+        let paths: Vec<sdf::Path> = recorder
+            .diff()
+            .iter()
+            .flat_map(|d| d.edits.iter().map(|e| e.path().clone()))
+            .collect();
+        assert!(paths.contains(&sdf::path("/FromRoot")?));
+        assert!(
+            paths.contains(&sdf::path("/FromWeak")?),
+            "the sublayer's edit is captured"
+        );
         Ok(())
     }
 

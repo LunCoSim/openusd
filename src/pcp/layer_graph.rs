@@ -27,6 +27,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::mem;
 use std::path;
 use std::rc::Rc;
@@ -359,10 +360,12 @@ impl LayerGraph {
         let mut resolution = mem::take(&mut self.sublayer_resolution);
 
         // Forest roots in strength order: session layers, then the root layer
-        // (each with no inherited context). A reference/payload target is reached
-        // from its own root in the orphan pass below with the empty context; the
-        // arc-inherited context, when any, is folded into its `Contextual` instance
-        // separately rather than into these shared edges.
+        // (each with no inherited context). A `${VAR}` root sublayer that reads the
+        // session's expression variables is resolved per-stack in
+        // [`build_stack_members`](Self::build_stack_members) with the session seed,
+        // not here — these shared edges stay context-free, just as a reference/
+        // payload target's arc-inherited context lives on its `Contextual` instance
+        // rather than in the shared edges.
         for &id in self.session_layers() {
             self.compose_edges(id, None, &mut visited, &mut all_edges, &mut resolution);
         }
@@ -591,7 +594,7 @@ impl LayerGraph {
         }
         let anchored = self
             .registry
-            .create_identifier_anchored(&sub_path, self.identifier(parent));
+            .create_identifier_anchored(&sub_path, self.real_path(parent));
         let sub_id = self.anchored_or_bare(&anchored, &sub_path);
         cache.entry(parent).or_default().insert(sub_path.into_owned(), anchored);
         sub_id
@@ -605,7 +608,31 @@ impl LayerGraph {
         let mut errors = Vec::new();
         if let Some(root) = self.root {
             let mut ancestors = HashSet::new();
-            self.detect_cycles(root, &mut ancestors, &mut errors);
+            let pruned = self.muted_session_subtree();
+            let session_vars = self.session_expression_variables(&pruned);
+            // The root's `${VAR}` sublayers resolve against the session variables,
+            // so when any are authored, detect cycles over those seed-resolved edges:
+            // the context-free shared edges omit a session-only sublayer, so a cycle
+            // back through it — a session variable pointing a root sublayer at the root
+            // or an ancestor — would otherwise go unreported. With no session
+            // variables the shared `children` are the root's edges.
+            //
+            // TODO(perf): a stage with session expression variables recomputes the
+            // muted subtree, the session variables, and the root's seed edges here
+            // after `rebuild_sublayer_stacks` already computed them for the members;
+            // threading all three through both would remove the duplication for that
+            // (uncommon) case.
+            let seed = (!session_vars.is_empty()).then(|| self.compose_contextual_edges(root, &session_vars));
+            let nodes = &self.nodes;
+            self.detect_cycles(
+                root,
+                |id| match &seed {
+                    Some(edges) => edges.get(&id).map_or(&[][..], |e| e.as_slice()),
+                    None => nodes.get(&id).map_or(&[][..], |n| n.children.as_slice()),
+                },
+                &mut ancestors,
+                &mut errors,
+            );
         }
         self.cycle_errors = errors;
     }
@@ -649,8 +676,15 @@ impl LayerGraph {
                 .map(|&id| (id, LayerOffset::IDENTITY))
                 .collect();
             if let Some(root) = self.root {
-                // The root layer is never muted (the Stage API rejects it).
-                root_members.extend(self.build_stack_members(root, &HashMap::new()));
+                // The root layer is never muted (the Stage API rejects it). Its
+                // `${VAR}` sublayers resolve against the session's composed
+                // expression variables — the session is part of the root layer stack
+                // — so seed the member computation with them: the root stack is a
+                // contextual stack whose edges resolve fresh, not the context-free
+                // shared `children`. `pruned` (the muted session subtree) is excluded
+                // from those variables, matching the members filter above.
+                let session_vars = self.session_expression_variables(&pruned);
+                root_members.extend(self.build_stack_members(root, &session_vars));
             }
             self.stacks.set_root(root_members);
         }
@@ -704,19 +738,10 @@ impl LayerGraph {
             return HashSet::new();
         }
         let session: HashSet<LayerId> = self.session_layers().iter().copied().collect();
-        let mut pruned = HashSet::new();
-        let mut pending: Vec<LayerId> = session.iter().copied().filter(|id| self.is_muted(*id)).collect();
-        while let Some(id) = pending.pop() {
-            if !pruned.insert(id) {
-                continue;
-            }
-            for &(child, _) in &self.nodes[&id].children {
-                if session.contains(&child) {
-                    pending.push(child);
-                }
-            }
-        }
-        pruned
+        let muted_roots = session.iter().copied().filter(|&id| self.is_muted(id));
+        muted_subtree(&session, muted_roots, |&id| {
+            self.nodes[&id].children.iter().map(|&(child, _)| child).collect()
+        })
     }
 
     /// Depth-first cycle scan recording [`Error::SublayerCycle`] for any edge
@@ -724,7 +749,13 @@ impl LayerGraph {
     /// explicit work stack so a deep chain does not overflow the native stack; an
     /// `Exit` frame pops the layer back out of the `ancestors` path after its
     /// subtree.
-    fn detect_cycles(&self, id: LayerId, ancestors: &mut HashSet<LayerId>, errors: &mut Vec<Error>) {
+    fn detect_cycles<'e>(
+        &self,
+        id: LayerId,
+        children_of: impl Fn(LayerId) -> &'e [(LayerId, LayerOffset)],
+        ancestors: &mut HashSet<LayerId>,
+        errors: &mut Vec<Error>,
+    ) {
         enum Step {
             Enter(LayerId),
             Exit(LayerId),
@@ -744,7 +775,7 @@ impl LayerGraph {
             // the non-cycle children; they are pushed reversed so they pop in
             // declared order.
             let mut to_visit = Vec::new();
-            for &(child, _) in &self.nodes[&id].children {
+            for &(child, _) in children_of(id) {
                 // A muted child is pruned from every stack, so a cycle through it
                 // never composes and is not reported.
                 if self.is_muted(child) {
@@ -801,6 +832,15 @@ impl LayerGraph {
         self.nodes[&id].layer.identifier()
     }
 
+    /// The resolved physical location of the layer with the given id — the
+    /// anchor for the relative asset paths it authors (C++
+    /// `SdfLayer::GetRealPath`). Equals the identifier except for a package,
+    /// whose real path is its package-relative default layer. Panics if
+    /// unknown.
+    pub(crate) fn real_path(&self, id: LayerId) -> &str {
+        self.nodes[&id].layer.real_path()
+    }
+
     /// Whether a layer with this id is present.
     pub(crate) fn contains(&self, id: LayerId) -> bool {
         self.nodes.contains_key(&id)
@@ -811,12 +851,14 @@ impl LayerGraph {
         &self.registry
     }
 
-    /// Resolves the location of the layer `anchor`, used to anchor the relative
-    /// asset paths authored there. Returns `None` when there is no anchor layer
-    /// or it cannot itself be resolved. Resolve a layer once and reuse the
-    /// result to anchor every asset path it authors.
+    /// The location that anchors the relative asset paths authored in the layer
+    /// `anchor`: its resolved [`real_path`](Self::real_path), recorded when the
+    /// loader opened it. Returns `None` when there is no anchor layer or it is
+    /// anonymous (no resolvable location, C++ `SdfLayer::GetRealPath` is
+    /// empty).
     pub(crate) fn anchor_location(&self, anchor: Option<LayerId>) -> Option<ResolvedPath> {
-        anchor.and_then(|layer| self.registry.resolve(self.identifier(layer)))
+        let layer = &self.nodes[&anchor?].layer;
+        (!layer.is_anonymous()).then(|| ResolvedPath::new(layer.real_path()))
     }
 
     /// Records that the layer at `asset_path` resolved but could not be read or
@@ -978,12 +1020,7 @@ impl LayerGraph {
         if seed_vars.is_empty() {
             return self.collect_plain(root);
         }
-        let mut resolution = mem::take(&mut self.sublayer_resolution);
-        let mut all_edges: Vec<(LayerId, SublayerEdges)> = Vec::new();
-        let mut visited: HashSet<LayerId> = HashSet::new();
-        self.compose_edges(root, Some(seed_vars), &mut visited, &mut all_edges, &mut resolution);
-        self.sublayer_resolution = resolution;
-        let edges: HashMap<LayerId, SublayerEdges> = all_edges.into_iter().collect();
+        let edges = self.compose_contextual_edges(root, seed_vars);
         let muted = &self.muted;
         let mut members = Vec::new();
         let mut ancestors = HashSet::new();
@@ -996,6 +1033,50 @@ impl LayerGraph {
             |id| edges.get(&id).map_or(&[][..], |e| e.as_slice()),
         );
         members
+    }
+
+    /// Composes the sublayer edges of the subtree rooted at `root` against
+    /// `seed_vars` — an inherited expression-variable context (a reference/payload
+    /// arc's, or the session's for the root stack) — into a per-stack edge map.
+    /// Unlike the shared [`LayerNode::children`], these edges are context-specific:
+    /// the same layer resolves its `${VAR}` sublayers differently under a different
+    /// seed, so a contextual stack keeps its own map, composed with a fresh visited
+    /// set rather than reusing the shared context-free edges.
+    fn compose_contextual_edges(
+        &mut self,
+        root: LayerId,
+        seed_vars: &HashMap<String, Value>,
+    ) -> HashMap<LayerId, SublayerEdges> {
+        let mut resolution = mem::take(&mut self.sublayer_resolution);
+        let mut all_edges: Vec<(LayerId, SublayerEdges)> = Vec::new();
+        let mut visited: HashSet<LayerId> = HashSet::new();
+        self.compose_edges(root, Some(seed_vars), &mut visited, &mut all_edges, &mut resolution);
+        self.sublayer_resolution = resolution;
+        all_edges.into_iter().collect()
+    }
+
+    /// Composes the expression variables authored across the session layer stack,
+    /// the strongest member winning. Seeds the root layer's `${VAR}` sublayer
+    /// resolution (see [`rebuild_sublayer_stacks`](Self::rebuild_sublayer_stacks)),
+    /// so a session opinion reaches the root's expression sublayers the way the
+    /// whole root layer stack's variables resolve a `${VAR}` reference (C++
+    /// `PcpExpressionVariables` composes the session and root layers together).
+    /// Empty when no session layer authors any, the common case that keeps the root
+    /// on the sessionless path.
+    ///
+    /// `pruned` is the muted session subtree ([`muted_session_subtree`](Self::muted_session_subtree)):
+    /// a muted layer and everything it sublayers contributes nothing, matching the
+    /// members the root stack drops.
+    fn session_expression_variables(&self, pruned: &HashSet<LayerId>) -> HashMap<String, Value> {
+        // `session_layers()` is the flattened session stack (each session layer
+        // then its sublayers, strongest first), so composing each unpruned member's
+        // own variables is the whole session contribution.
+        expr::compose_layer_variables(
+            self.session_layers()
+                .iter()
+                .filter(|id| !pruned.contains(id))
+                .map(|&id| self.nodes[&id].layer.data()),
+        )
     }
 
     /// The plain (no-inherited-context) members of the stack rooted at `root`,
@@ -1431,7 +1512,7 @@ impl LayerGraph {
         let asset_path = without_dot_segments(asset_path);
         let anchored = self
             .registry
-            .create_identifier_anchored(&asset_path, self.identifier(anchor));
+            .create_identifier_anchored(&asset_path, self.real_path(anchor));
         self.anchored_or_bare(&anchored, &asset_path)
     }
 
@@ -1575,19 +1656,62 @@ impl LayerGraph {
         !self.muted_identifiers.is_empty()
     }
 
-    /// Whether the reference/payload target `asset_path`, anchored against
-    /// `anchor` (the layer that authored the arc), names a muted layer — matched
-    /// by the canonical identifier it would be interned under (C++
-    /// `Pcp_MutedLayers::IsLayerMuted`, anchored against the containing layer; see
+    /// The muted-set identifier matched by the reference/payload target
+    /// `asset_path`, anchored against `anchor` (the layer that authored the arc),
+    /// or `None` when it names no muted layer. Matched by the canonical identifier
+    /// the target would be interned under (C++ `Pcp_MutedLayers::IsLayerMuted`,
+    /// anchored against the containing layer; see
     /// [`Indexer::arc_target_muted`](super::prim_indexer)). Unlike
     /// [`is_muted`](Self::is_muted), this matches before the layer is interned, so
-    /// the on-demand loader can recognize a muted target and skip opening it.
-    pub(crate) fn is_asset_muted(&self, asset_path: &str, anchor: Option<&ResolvedPath>) -> bool {
+    /// the on-demand loader can recognize a muted target and skip opening it, and
+    /// the returned identifier is the muted-set entry an unmute toggles, so a
+    /// not-yet-loaded target can record it as its unmute-fanout trace.
+    pub(crate) fn muted_asset_id(&self, asset_path: &str, anchor: Option<&ResolvedPath>) -> Option<String> {
         if self.muted_identifiers.is_empty() {
-            return false;
+            return None;
         }
-        self.muted_identifiers
-            .contains(&self.canonical_muted_id(asset_path, anchor))
+        let canonical = self.canonical_muted_id(asset_path, anchor);
+        self.muted_identifiers.contains(&canonical).then_some(canonical)
+    }
+
+    /// The layers of every composed stack — the effectively-present set the stage
+    /// filters muted collection diagnostics against (see
+    /// [`sublayer_error_contributes`](Self::sublayer_error_contributes)). Read from
+    /// the composed stacks (muting has pruned their muted subtrees), so it is a pure
+    /// function of the muted set and the graph, independent of which prim indices
+    /// are cached — a diagnostic's visibility does not change as the cache warms.
+    pub(crate) fn effective_layers(&self) -> HashSet<LayerId> {
+        self.stacks.member_layers()
+    }
+
+    /// Whether a collection diagnostic still contributes to composition once muting
+    /// is applied, so the stage keeps it (the loader reports every load failure raw,
+    /// unaware of muting). A non-sublayer error always survives. A missing or
+    /// unreadable sublayer survives only when its referencing layer is `effective`
+    /// (a member of some composed stack) and the sublayer it names is not itself
+    /// muted; otherwise muting prunes it and the raw diagnostic is spurious. The
+    /// `effective` set is a pure function of the muted set and the graph, so the
+    /// decision is deterministic across queries and independent of load order.
+    pub(crate) fn sublayer_error_contributes(&self, error: &Error, effective: &HashSet<LayerId>) -> bool {
+        let (asset_path, introduced_by) = match error {
+            Error::UnresolvedSublayer {
+                asset_path,
+                introduced_by,
+            }
+            | Error::MalformedSublayer {
+                asset_path,
+                introduced_by,
+                ..
+            } => (asset_path, introduced_by),
+            _ => return true,
+        };
+        let Some(referrer) = self.id_of(introduced_by) else {
+            return true;
+        };
+        effective.contains(&referrer)
+            && self
+                .muted_asset_id(asset_path, self.anchor_location(Some(referrer)).as_ref())
+                .is_none()
     }
 
     /// The muted layer identifiers, sorted for a deterministic result.
@@ -1614,7 +1738,11 @@ impl LayerGraph {
         // A mute toggles the muted set rather than the sublayer edges, so the
         // edge-diff scoping `build_sublayer_edges` uses does not apply; re-resolve
         // every instance (an unmuted layer rejoins stacks whose members no longer
-        // list it, which a member-set scope would miss).
+        // list it, which a member-set scope would miss). `rebuild_sublayer_stacks`
+        // refreshes the muted set and recomputes the root's session-seeded members,
+        // so muting a session layer that supplies a root `${VAR}` sublayer's variable
+        // re-resolves that sublayer out of (or into, among interned layers) the root
+        // stack.
         self.rebuild_sublayer_stacks(None);
         self.recompute_cycle_errors();
         self.recompute_relocates()
@@ -1668,6 +1796,33 @@ impl LayerGraph {
         }
         self.registry.create_identifier(path, anchor)
     }
+}
+
+/// The elements pruned by muting: each muted root and everything reachable from
+/// it through `children_of`, restricted to `scope`. The single rule for the
+/// effective session stack — a muted session layer and the whole subtree it
+/// sublayers contribute nothing — shared by graph composition (walking resolved
+/// [`LayerNode::children`] over [`LayerId`]s) and open-time collection (walking
+/// the collected layers' authored sublayer paths over identifiers), so the two
+/// cannot disagree on which session layers are effective.
+pub(crate) fn muted_subtree<T: Clone + Eq + Hash>(
+    scope: &HashSet<T>,
+    muted_roots: impl IntoIterator<Item = T>,
+    children_of: impl Fn(&T) -> Vec<T>,
+) -> HashSet<T> {
+    let mut pruned = HashSet::new();
+    let mut pending: Vec<T> = muted_roots.into_iter().filter(|id| scope.contains(id)).collect();
+    while let Some(id) = pending.pop() {
+        if !pruned.insert(id.clone()) {
+            continue;
+        }
+        for child in children_of(&id) {
+            if scope.contains(&child) {
+                pending.push(child);
+            }
+        }
+    }
+    pruned
 }
 
 /// Depth-first pre-order walk of a sublayer subtree, composing each hop's offset
@@ -1916,6 +2071,53 @@ mod tests {
         assert!(
             ids.contains(&leaf),
             "`b`'s ${{V}} sublayer resolves against `a`'s variable and composes",
+        );
+    }
+
+    /// A `${VAR}` root sublayer resolved by a session variable back onto the root
+    /// is a cycle, and it is reported: the session-seeded root edges feed cycle
+    /// detection, not just member collection, so the diagnostic surfaces rather
+    /// than the edge being silently pruned.
+    #[test]
+    fn session_var_sublayer_cycle() {
+        let mut session = sdf::Layer::new_in_memory("session.usda");
+        set_expr_var(&mut session, "WHICH", "root");
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${WHICH}.usda"`"#]);
+        });
+        let graph = LayerGraph::from_layers(vec![session, root], 1, sdf::LayerRegistry::default());
+        assert!(
+            graph.errors().iter().any(|e| matches!(e, Error::SublayerCycle { .. })),
+            "the session-resolved self-sublayer is reported as a cycle: {:?}",
+            graph.errors()
+        );
+    }
+
+    /// Muting a session layer that supplies a root `${VAR}` sublayer's variable
+    /// re-resolves the root edges: the sublayer it selected drops, rather than the
+    /// muted layer continuing to resolve it.
+    #[test]
+    fn mute_session_drops_sublayer() {
+        let mut session = sdf::Layer::new_in_memory("session.usda");
+        set_expr_var(&mut session, "WHICH", "a");
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${WHICH}.usda"`"#]);
+        });
+        let a = sdf::Layer::new_in_memory("a.usda");
+        let mut graph = LayerGraph::from_layers(vec![session, root, a], 1, sdf::LayerRegistry::default());
+        let a_id = graph.id_of("a.usda").unwrap();
+        let in_root = |g: &LayerGraph| g.root_layer_stack().iter().any(|&(id, _)| id == a_id);
+
+        assert!(
+            in_root(&graph),
+            "the session's WHICH=a resolves the root sublayer to a.usda"
+        );
+        graph.mute_layer("session.usda".to_string());
+        assert!(
+            !in_root(&graph),
+            "muting the session layer drops the variable, so the root sublayer no longer resolves"
         );
     }
 

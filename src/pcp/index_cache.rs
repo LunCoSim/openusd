@@ -26,8 +26,11 @@ use super::dependencies::Dependencies;
 use super::index_store::IndexStore;
 use super::instancing::PrototypeRegistry;
 use super::layer_graph::LayerGraph;
-use super::prim_graph::{ArcType, Node, NodeFlags, NodeId};
-use super::prim_index::{AncestorArc, CompositionContext, Demand, PrimIndex};
+use super::load_rules::LoadRules;
+use super::prim_graph::ArcType;
+use super::prim_index::{
+    AncestorArc, CompositionContext, Demand, PrimIndex, PropertyTargetKind, TargetMemo, TargetMemoKey,
+};
 use super::prim_resolve::InvalidTargetKind;
 use super::relocates::{apply_child_relocates, chain_through_relocates, effective_relocates};
 use super::{Error, LayerId, MapFunction, VariantFallbackMap};
@@ -61,10 +64,12 @@ pub struct IndexCache {
     store: IndexStore,
     /// Variant fallback selections tried when no authored selection exists.
     variant_fallbacks: VariantFallbackMap,
-    /// Whether payload arcs are expanded during composition, from the stage's
-    /// [`InitialLoadSet`](crate::usd::InitialLoadSet). Seeds every root build's
-    /// [`CompositionContext`] (see [`root_parent_context`](Self::root_parent_context)).
-    load_payloads: bool,
+    /// Per-path payload-inclusion policy (C++ `UsdStageLoadRules`), seeded at
+    /// construction from the stage's
+    /// [`InitialLoadSet`](crate::usd::InitialLoadSet) and mutated at runtime
+    /// through [`Self::set_load_rules`]. `IndexCache::build_index` consults it
+    /// per path, via [`Self::is_loaded`].
+    pub(super) load_rules: LoadRules,
     /// Value-clip resolution and its layer cache ([`ClipCache`], spec 12.3.4) —
     /// an independently-owned entity that the clip orchestration methods
     /// ([`resolve_clip_value`](Self::resolve_clip_value) and friends) delegate
@@ -105,9 +110,25 @@ pub struct IndexCache {
     /// index invalidation so they never go stale across an edit; they are
     /// recomputed on the next query.
     //
-    // TODO: repeated queries on the same conflicting property re-append within a
-    // session (no intervening edit) and duplicate. Settle this by computing the
-    // conflicts once at index build and having queries read them.
+    // A memoizable target query's invalid-target errors are memoized with its
+    // resolved targets (see
+    // [`PrimEntry::resolved_targets`](super::prim_index::PrimEntry)) and
+    // re-surfaced here, deduplicated, on a cache hit, so repeated reads of those
+    // properties no longer duplicate them. A non-memoizable target read (an
+    // instance proxy, the deleted-paths walk, or a resolution that read cross-prim
+    // instance state) still appends fresh each call.
+    //
+    // TODO: the `property_stack` inconsistent-property-type conflicts are still
+    // recomputed and re-appended on each call, so repeated stacks on the same
+    // conflicting property duplicate within a session. The per-pass double-report
+    // (one at prim build, one per `property_stack` query) is C++-faithful — the
+    // composition golden expects it — so a fix must preserve the per-pass count and
+    // collapse only the repeat `property_stack` calls. A `PrimEntry` memo (like the
+    // targets) would do that, but the conflict set depends on the prim's property
+    // specs, so it would need a property-add/remove invalidation branch in
+    // `classify_property_entry`; computing it eagerly at index build instead would
+    // add per-property work to every prim's build (a cost on Caldera-class stages).
+    // Deferred until a profile justifies one.
     query_errors: Vec<Error>,
     /// Paths whose [`ensure_index`](Self::ensure_index) call is still on the
     /// stack. Pre-caching an inherit/specialize target (and that target's own
@@ -137,6 +158,14 @@ pub struct IndexCache {
     /// [`register_prototype`](Self::register_prototype)). A cached view must not
     /// rely on this counter alone for paths that may be empty pending such
     /// materialization.
+    ///
+    /// A single stage-wide counter is deliberately coarse: every edit rebuilds
+    /// every cached value view, even unaffected ones. A per-prim revision would
+    /// let an unrelated prim's view survive, but value-only edits skip change
+    /// classification today (no producer says which prim's value moved), so a
+    /// per-prim bump would risk a stale read where this coarse counter is always
+    /// safe. Refine only with a value-edit classifier and a profile showing the
+    /// blanket rebuild dominates.
     ///
     /// [`Stage::attribute_query`]: crate::usd::Stage::attribute_query
     revision: u64,
@@ -191,13 +220,13 @@ impl IndexCache {
     /// [`LayerGraph`] and are read through [`LayerGraph::errors`].
     pub(crate) fn new(
         variant_fallbacks: VariantFallbackMap,
-        load_payloads: bool,
+        load_rules: LoadRules,
         collection_errors: Vec<Error>,
     ) -> Self {
         Self {
             store: IndexStore::default(),
             variant_fallbacks,
-            load_payloads,
+            load_rules,
             clip_cache: ClipCache::default(),
             prototypes: PrototypeRegistry::default(),
             redirected_prims: HashMap::new(),
@@ -712,11 +741,13 @@ impl IndexCache {
 
     /// The composition context for a namespace-root prim: empty except for the
     /// stage's variant fallbacks. Used to seed the root of an ordinary build and
-    /// of a materialized prototype.
+    /// of a materialized prototype. `load_payloads` is left at its `Default`
+    /// value — [`build_index`](Self::build_index) always overwrites it with a
+    /// per-path decision before the context is ever consumed, so the value
+    /// seeded here is never read.
     pub(super) fn root_parent_context(&self) -> CompositionContext {
         CompositionContext {
             variant_fallbacks: self.variant_fallbacks.clone(),
-            load_payloads: self.load_payloads,
             ..Default::default()
         }
     }
@@ -748,15 +779,28 @@ impl IndexCache {
         self.bump_revision();
     }
 
-    /// Spec-tier change consumer (C++ `Pcp_RescanForSpecs`) after an inert spec
-    /// add or remove at `(layer, path)`. The store refreshes each affected index's
-    /// `has_specs` flags in place and reports the ones it could not refresh; those
-    /// are dropped for rebuild. The transient query errors are cleared too — they
-    /// may reference a dropped prim.
-    pub(super) fn rescan_specs(&mut self, graph: &LayerGraph, layer: LayerId, path: &Path) {
-        for prim in self.store.refresh_specs(graph, layer, path) {
-            self.store.remove(&prim);
+    /// Spec-tier change consumer (C++ `Pcp_RescanForSpecs`) for one change round's
+    /// inert spec adds and removes, each a `(layer, path)` site. The store
+    /// refreshes every affected index's `has_specs` flags in place per site,
+    /// partitioning the indices into those refreshed in place and those it cannot
+    /// refresh; the latter are dropped for rebuild. Each in-place-refreshed index
+    /// then finalizes its memoized spec stack once, however many of this round's
+    /// sites reached it. The transient query errors are cleared too — they may
+    /// reference a dropped prim.
+    pub(super) fn rescan_specs(&mut self, graph: &LayerGraph, sites: &[(LayerId, Path)]) {
+        let mut refreshed: HashSet<Path> = HashSet::new();
+        let mut rebuild: HashSet<Path> = HashSet::new();
+        for (layer, path) in sites {
+            self.store
+                .refresh_specs(graph, *layer, path, &mut refreshed, &mut rebuild);
         }
+        for prim in &rebuild {
+            self.store.remove(prim);
+        }
+        // The rebuild set was just dropped from the store and `finalize_spec_stacks`
+        // skips a path with no cached entry, so an index that ended up in both sets
+        // is already excluded — the refreshed set needs no further filtering.
+        self.store.finalize_spec_stacks(graph, &refreshed);
         self.query_errors.clear();
     }
 
@@ -770,36 +814,74 @@ impl IndexCache {
         self.query_errors.clear();
     }
 
+    /// Drops one memoized `(prim, property)` resolved-target entry per item, for a
+    /// `targetPaths` / `connectionPaths` edit that leaves the graph intact (so the
+    /// index survives) but restales that property's composed targets. Keyed by the
+    /// edited property's [`TargetMemoKey`], so a prim's other relationships and
+    /// connections keep their memos. See
+    /// [`CacheChanges::did_change_targets`](super::change::CacheChanges).
+    pub(super) fn clear_target_memos<'p>(&mut self, memos: impl IntoIterator<Item = &'p (Path, TargetMemoKey)>) {
+        for (prim, key) in memos {
+            self.store.clear_target_memo(prim, key);
+        }
+    }
+
     /// Invalidates the cache after a layer-set change restructures only some
     /// prims: advances the composition revision (so cached value views rebuild)
     /// and drops just the cached indices that read one of the `affected` layers,
     /// via [`drop_indices_touching_layers`](Self::drop_indices_touching_layers).
-    /// Used for a layer-muting toggle, a `subLayers`/offset/relocate/`timeCodesPerSecond`
-    /// edit (see [`Changes::apply`](super::change::Changes::apply)), and a demanded
+    /// Used for a layer-muting toggle, a
+    /// `subLayers`/offset/relocate/`timeCodesPerSecond`/`expressionVariables` edit
+    /// (see [`Changes::apply`](super::change::Changes::apply)), and a demanded
     /// layer that introduces relocates; in each case the graph's precomputed
     /// layer-stack state is rebuilt by the mutation first, so the cache is all that
     /// remains. Drops exactly the cached indices whose composition reads an
     /// `affected` layer, leaving the rest warm.
-    pub(crate) fn invalidate_layers(&mut self, graph: &LayerGraph, affected: &HashSet<LayerId>) {
+    pub(crate) fn invalidate_layers(&mut self, affected: &HashSet<LayerId>) {
         self.bump_revision();
-        self.drop_indices_touching_layers(graph, affected);
+        self.drop_indices_touching_layers(affected);
+    }
+
+    /// Invalidates the cache after a layer-muting toggle of the layer with
+    /// canonical identifier `canonical`: advances the revision, then drops the
+    /// cached indices the toggle can restructure (see
+    /// [`Dependencies::indices_for_mute_toggle`](super::dependencies::Dependencies::indices_for_mute_toggle))
+    /// — those reading one of the `affected` layers, plus those that only skipped
+    /// the target and recorded `canonical` because it interned no reachable layer.
+    /// Unmuting such a target drops the referrer's stale index so it recomposes and
+    /// the load barrier finally opens the now-unmuted target.
+    pub(crate) fn invalidate_muting(&mut self, affected: &HashSet<LayerId>, canonical: &str) {
+        self.bump_revision();
+        let victims = self.store.dependencies().indices_for_mute_toggle(affected, canonical);
+        self.drop_index_victims(&victims);
     }
 
     /// Drop every cached prim index whose composition reads one of the `affected`
-    /// layers (per [`IndexStore::indices_touching_layers`]) — together with its
-    /// namespace descendants and any prototype the drops touch — leaving indices
-    /// that read none of them cached. Muting/unmuting or editing a layer can only
+    /// layers (per [`Dependencies::indices_for_layers`](super::dependencies::Dependencies::indices_for_layers))
+    /// — together with its namespace descendants and any prototype the drops touch —
+    /// leaving indices that read none of them cached. Editing a layer can only
     /// restructure prims that compose against a layer stack containing it (C++
     /// `PcpChanges` layer-stack fanout), so the rest of the cache stays warm.
-    fn drop_indices_touching_layers(&mut self, graph: &LayerGraph, affected: &HashSet<LayerId>) {
+    fn drop_indices_touching_layers(&mut self, affected: &HashSet<LayerId>) {
         if affected.is_empty() {
             return;
         }
-        let victims = self.store.indices_touching_layers(graph, affected);
+        let victims = self.store.dependencies().indices_for_layers(affected);
+        self.drop_index_victims(&victims);
+    }
+
+    /// Drops each victim prim index and the prototypes its drop touches — the tail
+    /// shared by [`drop_indices_touching_layers`](Self::drop_indices_touching_layers),
+    /// [`invalidate_muting`](Self::invalidate_muting), and
+    /// [`set_load_rules`](Self::set_load_rules).
+    pub(super) fn drop_index_victims(&mut self, victims: &[Path]) {
+        if victims.is_empty() {
+            return;
+        }
         // Evict prototypes whose instances or roots are among the victims, as the
         // prim-tier path in [`Changes::apply`](super::change::Changes::apply) does.
-        self.invalidate_prototypes(&victims);
-        for path in &victims {
+        self.invalidate_prototypes(victims);
+        for path in victims {
             self.drop_index_subtree(path);
         }
     }
@@ -921,7 +1003,7 @@ impl IndexCache {
             return Ok(None);
         };
         Ok(index.nodes().find_map(|node| {
-            (matches(node.arc) && node.has_specs() && !node.is_permission_denied()).then(|| {
+            (matches(node.arc) && node.has_specs()).then(|| {
                 // The layer stack the node composes in, captured so the edit target
                 // authors into it exactly rather than re-inferring it from layer
                 // membership: `None` for the stage root stack, else the target root
@@ -1205,13 +1287,44 @@ impl IndexCache {
             None => prim.clone(),
         };
         self.ensure_index(graph, &resolved_prim)?;
+
+        // A property whose prim composes in place (no instance redirect), read by
+        // the non-deleted walk, resolves into its own namespace, so its targets
+        // can memoize on the prim's own entry. Instance proxies map results back
+        // per instance and the deleted-paths walk is rare, so both resolve live.
+        // Whether the result is actually cacheable also turns on it not reading
+        // cross-prim instance state, decided once `compute_instance_targets` runs.
+        let is_connection = matches!(field, FieldKey::ConnectionPaths);
+        let memo_candidate = !deleted && anchor.is_none();
+        let memo_key = memo_candidate.then(|| TargetMemoKey {
+            kind: if is_connection {
+                PropertyTargetKind::Connection
+            } else {
+                PropertyTargetKind::Relationship
+            },
+            property_suffix: prop_suffix.clone(),
+        });
+        if let Some(key) = &memo_key {
+            if let Some(hit) = self.store.target_memo(&resolved_prim, key) {
+                let TargetMemo { targets, errors } = hit.clone();
+                // Re-surface the cached errors: an unrelated index invalidation may
+                // have cleared `query_errors` since, so push any it now lacks.
+                for error in errors {
+                    if !self.query_errors.contains(&error) {
+                        self.query_errors.push(error);
+                    }
+                }
+                return Ok(targets);
+            }
+        }
+
         // A connection/relationship target authored in a class that translates but
         // names a different instance of that class is dropped from that class
         // node's contribution (C++ `_TargetInClassAndTargetsInstance`). The cache
         // precomputes the cross-prim instance set; the per-node target walk
         // consults it so a valid stronger opinion for the same path survives.
-        let instance_targets = if deleted {
-            HashSet::new()
+        let (instance_targets, read_cross_prim) = if deleted {
+            (HashSet::new(), false)
         } else {
             self.compute_instance_targets(graph, &resolved_prim, field, &prop_suffix)?
         };
@@ -1239,9 +1352,9 @@ impl IndexCache {
         // Targets dropped during composition are reported in authored order, the
         // `invalid` list already honoring list-op composition (a target shadowed
         // by a stronger explicit, or retracted by a delete, is not reported).
-        let is_connection = matches!(field, FieldKey::ConnectionPaths);
+        let mut errs: Vec<Error> = Vec::new();
         for inv in invalid {
-            self.query_errors.push(match inv.kind {
+            errs.push(match inv.kind {
                 InvalidTargetKind::External => Error::InvalidExternalTargetPath {
                     is_connection,
                     target: inv.target,
@@ -1270,6 +1383,20 @@ impl IndexCache {
                 }
             }
         }
+        // Cache the in-place result for repeat queries, the errors travelling with
+        // it so a later cache hit can re-surface them. A resolution that read
+        // cross-prim instance state is excluded: a target prim's later
+        // instance-status change is not tracked by this property's invalidation,
+        // so it must resolve live. The deleted walk and instance proxies (no
+        // `memo_key`) just append to the transient channel.
+        if let Some(key) = memo_key.filter(|_| !read_cross_prim) {
+            let memo = TargetMemo {
+                targets: targets.clone(),
+                errors: errs.clone(),
+            };
+            self.store.set_target_memo(&resolved_prim, key, memo);
+        }
+        self.query_errors.append(&mut errs);
         Ok(targets)
     }
 
@@ -1283,13 +1410,19 @@ impl IndexCache {
     /// dropping/reporting are left to `resolve_path_list_op_validated`, which
     /// consults this set per node contribution. A target inside the class itself
     /// (`connectionPathInsideInheritedClass`) is never an instance target.
+    ///
+    /// Returns the set paired with whether any candidate was gathered — i.e.
+    /// whether the resolution read cross-prim instance state by composing target
+    /// prims. The target memo is unsafe in that case (a target prim's later
+    /// instance-status change is not tracked by the property's own
+    /// `did_change_targets`), so the caller skips memoization when it is `true`.
     fn compute_instance_targets(
         &mut self,
         graph: &LayerGraph,
         resolved_prim: &Path,
         field: FieldKey,
         prop_suffix: &str,
-    ) -> Result<HashSet<(Path, Path)>> {
+    ) -> Result<(HashSet<(Path, Path)>, bool)> {
         // Phase 1: gather candidates that translate, releasing the index borrow
         // before the cross-prim composition in phase 2.
         let mut candidates: Vec<InstanceCandidate> = Vec::new();
@@ -1297,7 +1430,7 @@ impl IndexCache {
         {
             let index = self.cached(resolved_prim);
             for node in index.nodes() {
-                if node.arc != ArcType::Inherit || !node.has_specs() || node.is_permission_denied() {
+                if node.arc != ArcType::Inherit || !node.has_specs() {
                     continue;
                 }
                 let class_path = node.path_at_introduction();
@@ -1341,6 +1474,9 @@ impl IndexCache {
         }
 
         // Phase 2: compose each target prim for the cross-prim inherit check.
+        // A non-empty candidate set means the result read another prim's instance
+        // status, so the caller must not memoize it.
+        let read_cross_prim = !candidates.is_empty();
         let mut instance_targets: HashSet<(Path, Path)> = HashSet::new();
         for c in candidates {
             let target_prim = c.translated.prim_path();
@@ -1349,7 +1485,7 @@ impl IndexCache {
                 instance_targets.insert((c.target, c.property));
             }
         }
-        Ok(instance_targets)
+        Ok((instance_targets, read_cross_prim))
     }
 
     /// Composes a relationship's target paths together with the paths its
@@ -1801,54 +1937,6 @@ impl IndexCache {
         }
     }
 
-    /// Returns the `(node, error)` pair for each direct composition arc on
-    /// `path` whose target site is `permission = private` (spec 10.3.3).
-    ///
-    /// A direct arc is a reference/inherit/payload/specialize authored at this
-    /// prim — its node sits at the prim's own namespace depth and is not an
-    /// implied class. Mirroring C++ `_AddArc` + `_InertSubtree`, the caller
-    /// surfaces the error and marks the node's subtree
-    /// [`PERMISSION_DENIED`](NodeFlags::PERMISSION_DENIED), so the arc stops
-    /// contributing to value resolution while staying visible structurally
-    /// (`nodes`, `has_spec`, child names are unchanged).
-    fn detect_arc_permissions(&self, graph: &LayerGraph, path: &Path, index: &PrimIndex) -> Vec<(NodeId, Error)> {
-        let depth = path.prim_element_count() as u16;
-        let mut denials = Vec::new();
-        for (id, node) in index.nodes_with_ids() {
-            let is_direct_arc = matches!(
-                node.arc,
-                ArcType::Inherit | ArcType::Specialize | ArcType::Reference | ArcType::Payload
-            ) && node.namespace_depth() == depth
-                && !node.flags().contains(NodeFlags::IMPLIED_CLASS);
-            if is_direct_arc && self.target_is_private(graph, node) {
-                denials.push((
-                    id,
-                    Error::ArcPermissionDenied {
-                        site_path: path.clone(),
-                        arc: node.arc,
-                        target_path: node.path.clone(),
-                    },
-                ));
-            }
-        }
-        denials
-    }
-
-    /// Returns `true` when the strongest `permission` opinion at a direct arc's
-    /// target site (read across the node's contributing layers) is `private`.
-    fn target_is_private(&self, graph: &LayerGraph, node: &Node) -> bool {
-        for &(layer, _) in graph.layer_stack(node.layer_stack_id()).iter() {
-            if let Ok(Some(value)) = graph
-                .layer(layer)
-                .data()
-                .try_field(&node.path, FieldKey::Permission.as_str())
-            {
-                return matches!(value.as_ref(), Value::Permission(sdf::Permission::Private));
-            }
-        }
-        false
-    }
-
     // ------------------------------------------------------------------
     // Core composition
     // ------------------------------------------------------------------
@@ -1913,6 +2001,11 @@ impl IndexCache {
             .and_then(|p| self.store.context_at(&p))
             .cloned()
             .unwrap_or_else(|| self.root_parent_context());
+        // Computed per path, not inherited from the parent context: two
+        // siblings can have different load rules, and a rule authored on an
+        // ancestor doesn't by itself determine this path's own decision (see
+        // `LoadRules::effective_rule`'s lookahead).
+        let load_payloads = self.is_loaded(path);
 
         // TODO(rayon): `build_with_cache` is a pure function of `graph`,
         // `&parent_ctx`, and the store's entries, so sibling prims compose
@@ -1921,7 +2014,7 @@ impl IndexCache {
         // mid-build — parallelizing the driver needs a concurrent map or a
         // topological (targets-first) build order.
         let (mut index, mut build_errors, pending_loads) =
-            match PrimIndex::build_with_cache(path, graph, &parent_ctx, self.store.entries()) {
+            match PrimIndex::build_with_cache(path, graph, &parent_ctx, self.store.entries(), load_payloads) {
                 Ok(result) => result,
                 Err(e) => return Err(e.into()),
             };
@@ -1948,10 +2041,9 @@ impl IndexCache {
                 _ => {}
             }
         }
-        // `build_errors` accumulates every error for this prim (the build errors
-        // above plus the permission denials below) and is carried into the prim's
-        // cache entry at the end, replacing any prior entry, so a rebuild never
-        // duplicates and a fixed prim drops its stale errors.
+        // `build_errors` accumulates every error for this prim and is carried
+        // into the prim's cache entry at the end, replacing any prior entry, so
+        // a rebuild never duplicates and a fixed prim drops its stale errors.
 
         // Inside an instance, local opinions on descendants are discarded
         // (spec 11.3.3): the subtree is composed purely from the arcs the
@@ -1959,24 +2051,6 @@ impl IndexCache {
         // marks the local root site inert for any prim whose parent context is
         // `within_instance`, so the local arcs are never followed — rather than
         // pruned afterwards, which would leave the nodes those local arcs spawned.
-
-        // Arc permissions (spec 10.3.3, C++ `_AddArc` + `_InertSubtree`). A
-        // direct arc to a `permission = private` site is reported and its target
-        // path recorded; an ancestor's denied targets arrive on `parent_ctx`.
-        // Every node reached through a denied arc — its grafted subtree here, or
-        // the same arc extended to this descendant prim — is then inerted: it
-        // stays visible structurally but contributes no opinions to value
-        // resolution. This runs before deriving instance state below so a
-        // private target's `instanceable`/arc opinions are already inert.
-        let mut denied_prefixes = parent_ctx.denied_prefixes.clone();
-        for (node_id, error) in self.detect_arc_permissions(graph, path, &index) {
-            let target = index.node(node_id).path.clone();
-            if !denied_prefixes.contains(&target) {
-                denied_prefixes.push(target);
-            }
-            build_errors.push(error);
-        }
-        index.mark_permission_denied_under(&denied_prefixes);
 
         // Inside an instance, the ancestral references the instance prim is
         // nested under contribute opinions at the instance's own namespace that
@@ -1993,9 +2067,9 @@ impl IndexCache {
         // This prim is an instance when its composition declares
         // `instanceable = true` and carries an arc; its descendants then
         // inherit `within_instance`. A nested instance therefore re-arms the
-        // flag for its own subtree. Computed from the freshly built index (after
-        // permission inerting, so it agrees with a later `Prim::is_instance`)
-        // to avoid re-entering `ensure_index` for `path`.
+        // flag for its own subtree. Computed from the freshly built index so it
+        // agrees with a later `Prim::is_instance`, avoiding re-entering
+        // `ensure_index` for `path`.
         let is_instance = index.has_composition_arc()
             && matches!(
                 index.resolve_field(FieldKey::Instanceable.as_str(), graph, None)?,
@@ -2011,7 +2085,6 @@ impl IndexCache {
         } else {
             parent_ctx.instance_depth
         };
-        child_context.denied_prefixes = denied_prefixes;
         self.cache_index(graph, path, index, child_context, build_errors);
         // Report inconsistent property types once per prim composition (C++
         // `PcpErrorInconsistentPropertyType`); a later property-stack query
@@ -2152,7 +2225,10 @@ mod tests {
         let registry = sdf::LayerRegistry::default();
         let layers = registry.collect_with_arcs(path).expect("collect layers");
         let graph = LayerGraph::from_layers(layers, 0, registry);
-        (graph, IndexCache::new(VariantFallbackMap::new(), true, Vec::new()))
+        (
+            graph,
+            IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new()),
+        )
     }
 
     /// Parses in-memory USDA text into a single `root.usda` layer.
@@ -2171,7 +2247,10 @@ mod tests {
     /// composition cases that need no on-disk asset.
     fn in_memory_stack(text: &str) -> (LayerGraph, IndexCache) {
         let graph = LayerGraph::from_layers(vec![parse_layer(text)], 0, sdf::LayerRegistry::default());
-        (graph, IndexCache::new(VariantFallbackMap::new(), true, Vec::new()))
+        (
+            graph,
+            IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new()),
+        )
     }
 
     /// Run `f` as one atomic transaction on `layer` and return the recorded change
@@ -2203,7 +2282,10 @@ mod tests {
         let id = registry.create_identifier(path, None);
         let data = registry.open(path).expect("open root").expect("root resolves");
         let graph = LayerGraph::from_layers(vec![sdf::Layer::new(id, data)], 0, registry);
-        (graph, IndexCache::new(VariantFallbackMap::new(), true, Vec::new()))
+        (
+            graph,
+            IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new()),
+        )
     }
 
     /// A prim inheriting its own grand-descendant (`/A` inherits `/A/B/C`) is a
@@ -2282,141 +2364,6 @@ def "A" (
         assert_eq!(
             children.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             ["c", "b", "a", "d"]
-        );
-        Ok(())
-    }
-
-    /// A direct inherit to a `permission = private` class is reported as a
-    /// non-fatal `ArcPermissionDenied` (spec 10.3.3), while the private class
-    /// stays in the prim stack — C++ keeps the node and only records the error.
-    /// Ground truth: `ErrorPermissionDenied_root` (`/Model` inherits the
-    /// private `/_PrivateClass`).
-    #[test]
-    fn inherit_private_class_reports_arc() -> Result<()> {
-        let root = format!(
-            "{}/vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/\
-             ErrorPermissionDenied_root/usda/root.usd",
-            manifest_dir()
-        );
-        let (graph, mut cache) = collected_stack(&root);
-        let model = sdf::path("/Model")?;
-        let private = sdf::path("/_PrivateClass")?;
-        cache.ensure_index(&graph, &model)?;
-
-        // Structural visibility is unchanged: the private class still composes
-        // into the prim stack (it is inerted for value resolution, not removed).
-        assert!(
-            cache.cached(&model).nodes().any(|n| n.path == private),
-            "private inherited class must remain in the prim stack"
-        );
-
-        // The direct inherit-to-private arc is queued for the stage to surface.
-        let pending = cache.take_composition_errors();
-        assert!(
-            pending.iter().any(|e| matches!(
-                e,
-                Error::ArcPermissionDenied { site_path, arc, target_path }
-                    if *site_path == model && *arc == ArcType::Inherit && *target_path == private
-            )),
-            "expected ArcPermissionDenied for /Model -> /_PrivateClass, got {pending:?}"
-        );
-        Ok(())
-    }
-
-    /// A direct inherit to a private class is inerted (C++ `_InertSubtree`): the
-    /// inherited opinion is dropped from value resolution, yet the class stays
-    /// in the prim stack and `has_spec`. A public inherit is the control.
-    #[test]
-    fn private_inherit_inerts_opinions() -> Result<()> {
-        let root = format!("{}/fixtures/permission_private_inherit/root.usda", manifest_dir());
-        let (graph, mut cache) = collected_stack(&root);
-
-        // Control: a public inherit contributes its opinion.
-        assert_eq!(
-            cache.resolve_field(&graph, &sdf::path("/ViaPublic.attr")?, FieldKey::Default.as_str())?,
-            Some(Value::Double(1.0)),
-            "public inherited opinion must contribute"
-        );
-
-        // The private inherit is inerted: no opinion reaches value resolution,
-        // but the class node and the property stay structurally present.
-        let via_private = sdf::path("/ViaPrivate")?;
-        let private_class = sdf::path("/PrivateClass")?;
-        assert_eq!(
-            cache.resolve_field(&graph, &sdf::path("/ViaPrivate.attr")?, FieldKey::Default.as_str())?,
-            None,
-            "private inherited opinion must not contribute to value resolution"
-        );
-        assert!(
-            cache.cached(&via_private).nodes().any(|n| n.path == private_class),
-            "private class stays in the prim stack"
-        );
-        assert!(
-            cache.has_spec(&graph, &sdf::path("/ViaPrivate.attr")?)?,
-            "the inherited attr stays structurally present"
-        );
-        Ok(())
-    }
-
-    /// The denial propagates to descendant prims composed separately: a child
-    /// inherited through the private arc (an extended, not direct, arc) is
-    /// inerted too, while the public child's opinion still resolves and the
-    /// child name stays visible.
-    #[test]
-    fn private_inherit_inerts_descendants() -> Result<()> {
-        let root = format!("{}/fixtures/permission_private_inherit/root.usda", manifest_dir());
-        let (graph, mut cache) = collected_stack(&root);
-
-        // Control: the public inherited child contributes its opinion.
-        assert_eq!(
-            cache.resolve_field(
-                &graph,
-                &sdf::path("/ViaPublic/Child.cattr")?,
-                FieldKey::Default.as_str()
-            )?,
-            Some(Value::Double(2.0)),
-            "public inherited child opinion must contribute"
-        );
-
-        // The private inherited child is inerted, but stays visible: the child
-        // name is exposed and the property has a spec.
-        assert_eq!(
-            cache.resolve_field(
-                &graph,
-                &sdf::path("/ViaPrivate/Child.cattr")?,
-                FieldKey::Default.as_str()
-            )?,
-            None,
-            "private inherited child opinion must not contribute"
-        );
-        assert!(
-            cache
-                .prim_children(&graph, &sdf::path("/ViaPrivate")?)?
-                .iter()
-                .any(|t| t.as_str() == "Child"),
-            "the inherited child name stays visible"
-        );
-        Ok(())
-    }
-
-    /// A private arc that authors `instanceable = true` is inerted before
-    /// instance state is derived, so the prim is not treated as an instance and
-    /// its local child opinions survive (the descendant subtree is not composed
-    /// as a discarded-local instance subtree).
-    #[test]
-    fn private_instanceable_arc_not_instance() -> Result<()> {
-        let root = format!("{}/fixtures/permission_private_inherit/root.usda", manifest_dir());
-        let (graph, mut cache) = collected_stack(&root);
-
-        let host = sdf::path("/InstHost")?;
-        assert!(
-            !cache.is_instance(&graph, &host)?,
-            "a private (inerted) instanceable arc must not make the prim an instance"
-        );
-        assert_eq!(
-            cache.resolve_field(&graph, &sdf::path("/InstHost/Local.lattr")?, FieldKey::Default.as_str())?,
-            Some(Value::Double(7.0)),
-            "the local child opinion must survive (within_instance not armed)"
         );
         Ok(())
     }
@@ -2537,7 +2484,7 @@ def "A" (
         let data = crate::usda::parser::Parser::new(text).parse().expect("parse usda");
         let layer = sdf::Layer::new("root.usda", Box::new(sdf::Data::from_specs(data)));
         let graph = LayerGraph::from_layers(vec![layer], 0, sdf::LayerRegistry::default());
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
 
         let child = sdf::path("/A/B")?;
         cache.ensure_index(&graph, &child)?;
@@ -2611,7 +2558,7 @@ def "A" (
         let data = crate::usda::parser::Parser::new(text).parse().expect("parse usda");
         let layer = sdf::Layer::new("root.usda", Box::new(sdf::Data::from_specs(data)));
         let graph = LayerGraph::from_layers(vec![layer], 0, sdf::LayerRegistry::default());
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
 
         let a = sdf::path("/A")?;
         cache.ensure_index(&graph, &a)?;
@@ -2723,6 +2670,148 @@ def "Scope"
             cache.value_at(&graph, &sdf::path("/Model.source")?, 0.0, &interp)?,
             Some(Value::String("right".to_string())),
             "the referencing layer's TARGET override resolves the nested reference to right.usda"
+        );
+        Ok(())
+    }
+
+    /// The sub-root twin of `expr_vars_compose_across_reference`: `/Model`
+    /// references a sub-root target `/Sub/Prim`, so composing it spawns a
+    /// nested ancestral sub-index (`Indexer::compose_and_graft`) for `/Sub`
+    /// and `/Sub/Prim`. `/Sub`'s own reference expression must still resolve
+    /// against the outer (root) layer's `TARGET`, not mid.usda's own local
+    /// value, even though it composes inside that disjoint nested build.
+    #[test]
+    fn expr_vars_subroot_reference() -> Result<()> {
+        let root = format!("{}/fixtures/expr_vars_compose_subroot/root.usda", manifest_dir());
+        let (graph, mut cache) = collected_stack(&root);
+        let interp = |_: &sdf::TimeSampleMap, _: f64| None;
+        assert_eq!(
+            cache.value_at(&graph, &sdf::path("/Model.source")?, 0.0, &interp)?,
+            Some(Value::String("right".to_string())),
+            "the outer layer's TARGET override resolves Sub's ancestral reference to right.usda \
+             even though it composes inside the sub-root target's nested sub-build"
+        );
+        Ok(())
+    }
+
+    /// Editing a layer stack's `expressionVariables` re-resolves a `${VAR}`
+    /// reference asset path and recomposes the cached index: with `PICK = "a"`
+    /// the reference draws a.usda's opinion, and editing it to "b" yields
+    /// b.usda's — the under-invalidation (stale-read) guard.
+    #[test]
+    fn expr_var_edit_recomposes_reference() -> Result<()> {
+        let root = parse_named_layer(
+            "root.usda",
+            "#usda 1.0\n(\n    expressionVariables = {\n        string PICK = \"a\"\n    }\n)\n\
+             def \"R\" (\n    references = @`\"${PICK}.usda\"`@</X>\n) {}\n",
+        );
+        let a = parse_named_layer("a.usda", "#usda 1.0\ndef \"X\" { custom double y = 1 }\n");
+        let b = parse_named_layer("b.usda", "#usda 1.0\ndef \"X\" { custom double y = 2 }\n");
+        let mut graph = LayerGraph::from_layers(vec![root, a, b], 0, sdf::LayerRegistry::default());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
+        let root_id = graph.root_id().unwrap();
+        let interp = |_: &sdf::TimeSampleMap, _: f64| None;
+        let y = sdf::path("/R.y")?;
+
+        assert_eq!(
+            cache.value_at(&graph, &y, 0.0, &interp)?,
+            Some(Value::Double(1.0)),
+            "the PICK-valued reference resolves to a.usda"
+        );
+
+        let cl = edit_layer(&mut graph.get_mut(root_id).unwrap().layer, |e| {
+            e.set_expression_variables(HashMap::from([("PICK".to_string(), Value::String("b".into()))]))
+        })?;
+        let mut changes = crate::pcp::Changes::new();
+        changes.did_change(&cache, &[(root_id, &cl)]);
+        changes.apply(&mut cache, &mut graph);
+
+        assert_eq!(
+            cache.value_at(&graph, &y, 0.0, &interp)?,
+            Some(Value::Double(2.0)),
+            "editing PICK re-resolves the reference to b.usda and recomposes the cached index"
+        );
+        Ok(())
+    }
+
+    /// An `expressionVariables` edit on a referenced layer drops only the indices
+    /// that read it: the referencing prim's index is evicted, while a sibling
+    /// composed solely from the root keeps its cached index — the
+    /// over-invalidation (dropped-sibling) guard.
+    #[test]
+    fn expr_var_edit_scoped_drop() -> Result<()> {
+        let root = parse_named_layer(
+            "root.usda",
+            "#usda 1.0\ndef \"Local\" {}\ndef \"Ref\" (\n    references = @base.usda@</Base>\n) {}\n",
+        );
+        let base = parse_named_layer("base.usda", "#usda 1.0\ndef \"Base\" {}\n");
+        let mut graph = LayerGraph::from_layers(vec![root, base], 0, sdf::LayerRegistry::default());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
+        let base_id = graph.id_of("base.usda").unwrap();
+        let local = sdf::path("/Local")?;
+        let refp = sdf::path("/Ref")?;
+
+        cache.ensure_index(&graph, &local)?;
+        cache.ensure_index(&graph, &refp)?;
+        assert!(cache.store.index_at(&local).is_some());
+        assert!(cache.store.index_at(&refp).is_some());
+
+        let cl = edit_layer(&mut graph.get_mut(base_id).unwrap().layer, |e| {
+            e.set_expression_variables(HashMap::from([("V".to_string(), Value::String("x".into()))]))
+        })?;
+        let mut changes = crate::pcp::Changes::new();
+        changes.did_change(&cache, &[(base_id, &cl)]);
+        changes.apply(&mut cache, &mut graph);
+
+        assert!(
+            cache.store.index_at(&local).is_some(),
+            "the root-only sibling does not read base.usda, so its index stays warm"
+        );
+        assert!(
+            cache.store.index_at(&refp).is_none(),
+            "the referencing prim reads base.usda, so the expr-var edit drops its index"
+        );
+        Ok(())
+    }
+
+    /// A `targetPaths` edit clears only the edited relationship's memo; a sibling
+    /// relationship on the same prim keeps its cached resolved-target list — the
+    /// suffix-precise target-memo clear.
+    #[test]
+    fn target_edit_clears_one_memo() -> Result<()> {
+        let (mut graph, mut cache) = in_memory_stack(
+            "#usda 1.0\ndef \"P\" {\n    rel relA = [</X>]\n    rel relB = [</Y>]\n}\ndef \"X\" {}\ndef \"Y\" {}\n",
+        );
+        let root_id = graph.root_id().unwrap();
+        let p_prim = sdf::path("/P")?;
+        let key = |suffix: &str| TargetMemoKey {
+            kind: PropertyTargetKind::Relationship,
+            property_suffix: suffix.to_owned(),
+        };
+
+        // The first query of each relationship populates its memo on /P's entry.
+        cache.relationship_targets(&graph, &sdf::path("/P.relA")?)?;
+        cache.relationship_targets(&graph, &sdf::path("/P.relB")?)?;
+        assert!(cache.store.target_memo(&p_prim, &key(".relA")).is_some());
+        assert!(cache.store.target_memo(&p_prim, &key(".relB")).is_some());
+
+        let cl = edit_layer(&mut graph.get_mut(root_id).unwrap().layer, |e| {
+            e.relationship_mut("/P.relA")
+                .expect("relationship spec")
+                .set_target_paths([sdf::path("/Z").unwrap()]);
+            Ok(())
+        })?;
+        let mut changes = crate::pcp::Changes::new();
+        changes.did_change(&cache, &[(root_id, &cl)]);
+        changes.apply(&mut cache, &mut graph);
+
+        assert!(
+            cache.store.target_memo(&p_prim, &key(".relA")).is_none(),
+            "the edited relationship's memo is cleared"
+        );
+        assert!(
+            cache.store.target_memo(&p_prim, &key(".relB")).is_some(),
+            "the sibling relationship's memo survives the suffix-precise clear"
         );
         Ok(())
     }
@@ -3201,7 +3290,7 @@ def "Scope"
         let weak = parse_named_layer("weak.usd", "#usda 1.0\ndef \"A\" { custom int x = 1 }\n");
         let mut graph = LayerGraph::from_layers(vec![root, weak], 0, sdf::LayerRegistry::default());
         let root_id = graph.id_of("root.usd").unwrap();
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
         let a = sdf::path("/A")?;
 
         // Before the edit only the weak sublayer authors /A.
@@ -3229,7 +3318,67 @@ def "Scope"
             vec![("root.usd".into(), a.clone()), ("weak.usd".into(), a.clone())],
             "the spec-tier refresh adds the new strong site to the prim stack"
         );
-        let mut fresh = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut fresh = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
+        assert_eq!(
+            refreshed,
+            fresh.prim_stack(&graph, &a)?,
+            "in-place refresh matches a fresh build"
+        );
+        Ok(())
+    }
+
+    /// A single change round whose inert spec adds reach the same index through
+    /// several sites stays correct. `/A` composes across three sublayers; adding an
+    /// `over "A"` into two of them in one round produces two `(layer, /A)` sites
+    /// that both reach index `/A`, and the batched rescan must compose the prim
+    /// stack a fresh build would. (The batch also finalizes each index's stack once
+    /// per round, but the idempotent finalize makes that performance property
+    /// invisible to the result; this guards the correctness it must preserve.)
+    #[test]
+    fn spec_refresh_multi_site() -> Result<()> {
+        let root = parse_named_layer("root.usd", "#usda 1.0\n(\n    subLayers = [@mid.usd@, @weak.usd@]\n)\n");
+        let mid = parse_named_layer("mid.usd", "#usda 1.0\n");
+        let weak = parse_named_layer("weak.usd", "#usda 1.0\ndef \"A\" { custom int x = 1 }\n");
+        let mut graph = LayerGraph::from_layers(vec![root, mid, weak], 0, sdf::LayerRegistry::default());
+        let root_id = graph.id_of("root.usd").unwrap();
+        let mid_id = graph.id_of("mid.usd").unwrap();
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
+        let a = sdf::path("/A")?;
+
+        // Only the weakest sublayer authors /A before the edit.
+        assert_eq!(cache.prim_stack(&graph, &a)?, vec![("weak.usd".into(), a.clone())]);
+
+        // In one change round author an inert `over "A"` into both the root and
+        // the middle sublayer — two spec-tier sites that both reach index /A.
+        let cl_root = edit_layer(&mut graph.get_mut(root_id).unwrap().layer, |l| {
+            sdf::PrimSpecMut::over(l.data_mut(), "/A")?;
+            Ok(())
+        })
+        .unwrap();
+        let cl_mid = edit_layer(&mut graph.get_mut(mid_id).unwrap().layer, |l| {
+            sdf::PrimSpecMut::over(l.data_mut(), "/A")?;
+            Ok(())
+        })
+        .unwrap();
+        let mut changes = crate::pcp::Changes::new();
+        changes.did_change(&cache, &[(root_id, &cl_root), (mid_id, &cl_mid)]);
+        assert!(changes.cache.did_change_specs.contains(&(root_id, a.clone())));
+        assert!(changes.cache.did_change_specs.contains(&(mid_id, a.clone())));
+        changes.apply(&mut cache, &mut graph);
+
+        // Both new sites joined the stack in strength order, matching a fresh
+        // composition of the edited layers.
+        let refreshed = cache.prim_stack(&graph, &a)?;
+        assert_eq!(
+            refreshed,
+            vec![
+                ("root.usd".into(), a.clone()),
+                ("mid.usd".into(), a.clone()),
+                ("weak.usd".into(), a.clone()),
+            ],
+            "the batched spec-tier refresh adds both new strong sites"
+        );
+        let mut fresh = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
         assert_eq!(
             refreshed,
             fresh.prim_stack(&graph, &a)?,
@@ -3252,7 +3401,7 @@ def "Scope"
         let base = parse_named_layer("base.usd", "#usda 1.0\ndef \"Other\" {}\n");
         let mut graph = LayerGraph::from_layers(vec![root, base], 0, sdf::LayerRegistry::default());
         let base_id = graph.id_of("base.usd").unwrap();
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
         let a = sdf::path("/A")?;
 
         // The empty target makes /A's reference culled — no composition arc.
@@ -3296,7 +3445,7 @@ def "Scope"
         let root = parse_named_layer("root.usd", "#usda 1.0\ndef \"A\" ( inherits = </_class_Foo> ) {}\n");
         let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
         let root_id = graph.id_of("root.usd").unwrap();
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
         let a = sdf::path("/A")?;
 
         // The empty class makes /A's inherit culled — no composition arc.
@@ -3329,7 +3478,7 @@ def "Scope"
         let root = parse_named_layer("root.usd", "#usda 1.0\ndef \"A\" ( specializes = </_class_Foo> ) {}\n");
         let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
         let root_id = graph.id_of("root.usd").unwrap();
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
         let a = sdf::path("/A")?;
 
         assert!(!cache.has_composition_arc(&graph, &a)?);
@@ -3436,7 +3585,7 @@ def "Scope"
         let base = parse_named_layer("base.usd", "#usda 1.0\ndef \"Other\" {}\n");
         let mut graph = LayerGraph::from_layers(vec![root, base], 0, sdf::LayerRegistry::default());
         let base_id = graph.id_of("base.usd").unwrap();
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
         let a = sdf::path("/A")?;
 
         // The missing nested target makes /A's reference contribute nothing.
@@ -3474,7 +3623,7 @@ def "Scope"
         let weak = parse_named_layer("weak.usda", "#usda 1.0\ndef \"World\" {\n  def \"Child\" {}\n}\n");
         let mut graph = LayerGraph::from_layers(vec![strong, weak], 0, sdf::LayerRegistry::default());
         let strong_id = graph.root_id().unwrap();
-        let mut cache = IndexCache::new(VariantFallbackMap::new(), true, Vec::new());
+        let mut cache = IndexCache::new(VariantFallbackMap::new(), LoadRules::all(), Vec::new());
 
         let world = sdf::path("/World")?;
         let has_child = |cache: &mut IndexCache, graph: &LayerGraph| -> Result<bool> {

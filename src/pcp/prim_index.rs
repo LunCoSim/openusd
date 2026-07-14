@@ -35,6 +35,20 @@ pub struct PrimIndex {
     /// artifact, kept off [`PrimIndexGraph`] so the indexer's structural seed
     /// clone does not carry it.
     spec_stack: Vec<SpecSite>,
+    /// Arena handles sorted by node path: the spec-tier refresh's site index.
+    /// Every node sitting at a given path forms one contiguous run, found by
+    /// binary search in [`nodes_at`](Self::nodes_at), so
+    /// [`refresh_has_specs_at`](Self::refresh_has_specs_at) reaches a changed
+    /// site's nodes without scanning the whole arena. A permutation of handles
+    /// like the graph's strength order, holding [`NodeId`]s only — it clones no
+    /// paths, so it stays cheap against the heap-backed [`Path`](crate::sdf::Path).
+    /// Built once per composition by [`build_path_order`](Self::build_path_order)
+    /// and carried with the index; the spec-tier refresh changes only flags, never
+    /// structure, so it stays valid across an in-place refresh. Lists every arena
+    /// node — inert, culled, and the synthetic root — so the refresh sees each
+    /// site's full candidate set. Like [`spec_stack`](Self::spec_stack), it is kept
+    /// off [`PrimIndexGraph`] so the indexer's seed clone does not carry it.
+    path_order: Vec<NodeId>,
 }
 
 /// The cache's per-prim composition record: the composed [`PrimIndex`], the
@@ -54,6 +68,48 @@ pub(crate) struct PrimEntry {
     /// Recoverable composition errors recorded while building [`index`](Self::index),
     /// replaced wholesale on each rebuild so they always reflect the current
     /// composition.
+    pub errors: Vec<Error>,
+    /// Lazily-memoized resolved property targets — cached composed query output,
+    /// not authored data — keyed by property kind and suffix. Filled on the first
+    /// [`relationship_targets`] / [`connection_paths`] query for a property whose
+    /// prim composes in place and whose resolution is a pure function of this
+    /// prim's own opinions, and dropped with the entry; a `targetPaths` /
+    /// `connectionPaths` edit clears it through
+    /// [`did_change_targets`](super::change::CacheChanges). Instance proxies, the
+    /// deleted-paths walk, and a resolution that consults cross-prim instance
+    /// state resolve live and are never cached.
+    ///
+    /// [`relationship_targets`]: super::index_cache::IndexCache::relationship_targets
+    /// [`connection_paths`]: super::index_cache::IndexCache::connection_paths
+    pub resolved_targets: HashMap<TargetMemoKey, TargetMemo>,
+}
+
+/// Which path-list-op field a [`TargetMemo`] resolved. Narrower than
+/// [`FieldKey`] so the memo map admits only the two fields that carry targets,
+/// not arbitrary fields like `timeSamples`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum PropertyTargetKind {
+    /// A relationship's `targetPaths`.
+    Relationship,
+    /// An attribute's `connectionPaths`.
+    Connection,
+}
+
+/// Key into a prim's [`resolved_targets`](PrimEntry::resolved_targets) memo: the
+/// property kind plus its suffix within the prim (e.g. `.binding`), so a
+/// relationship and a same-named connection never share an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct TargetMemoKey {
+    pub kind: PropertyTargetKind,
+    pub property_suffix: String,
+}
+
+/// One property's memoized resolved-target list plus the recoverable errors its
+/// resolution surfaced, re-surfaced on a cache hit. See
+/// [`resolved_targets`](PrimEntry::resolved_targets).
+#[derive(Clone)]
+pub(crate) struct TargetMemo {
+    pub targets: Vec<Path>,
     pub errors: Vec<Error>,
 }
 
@@ -155,12 +211,21 @@ impl PrimIndex {
         &self.graph.muted_external_targets
     }
 
+    /// Canonical identifiers of reference/payload targets this prim's composition
+    /// resolved to but skipped because they were muted before ever loading. Their
+    /// targets never interned, so — unlike
+    /// [`muted_external_targets`](Self::muted_external_targets) — there is no
+    /// [`LayerId`] to fan an unmute out by; the change machinery keys the fanout on
+    /// these identifiers instead (see
+    /// [`PrimIndexGraph::muted_unloaded_targets`](super::prim_graph::PrimIndexGraph)).
+    pub(crate) fn muted_unloaded_targets(&self) -> &[String] {
+        &self.graph.muted_unloaded_targets
+    }
+
     /// Iterates the spec stack's live contributing sites — those whose node is
     /// neither inert nor culled, the same structural filter
     /// [`nodes`](Self::nodes) applies — each paired with its resolved node. The
-    /// single home for that filter, shared by every spec-stack consumer (value
-    /// resolution adds `!is_permission_denied()`; the `prim_stack` /
-    /// `property_stack` introspection keeps denied sites).
+    /// single home for that filter, shared by every spec-stack consumer.
     pub(crate) fn live_spec_sites(&self) -> impl Iterator<Item = (&SpecSite, &Node)> + '_ {
         self.spec_stack.iter().filter_map(|site| {
             let node = self.node(site.node);
@@ -209,24 +274,6 @@ impl PrimIndex {
         self.graph.root.is_valid().then_some(self.graph.root)
     }
 
-    /// Marks every node whose path lies under one of `prefixes`
-    /// [`PERMISSION_DENIED`](NodeFlags::PERMISSION_DENIED), so value resolution
-    /// skips their opinions while they stay visible structurally — the C++
-    /// `_InertSubtree` behavior for a direct arc to a `permission = private`
-    /// site (spec 10.3.3). The prefixes are the denied arcs' target paths, so a
-    /// node reached through such an arc (its grafted subtree, an implied-class
-    /// copy, or an arc extended to a descendant prim) is inerted uniformly.
-    pub(crate) fn mark_permission_denied_under(&mut self, prefixes: &[Path]) {
-        if prefixes.is_empty() {
-            return;
-        }
-        for node in &mut self.graph.nodes {
-            if prefixes.iter().any(|prefix| node.path.has_prefix(prefix)) {
-                node.flags |= NodeFlags::PERMISSION_DENIED;
-            }
-        }
-    }
-
     /// Recomputes `has_specs` from live layer data for every node sitting at
     /// site `(layer, path)`, reporting what the caller must do next.
     ///
@@ -244,9 +291,9 @@ impl PrimIndex {
     /// contributing arc target that loses its last spec (it must cull to match an
     /// always-empty target, so a later re-add takes the un-cull path).
     //
-    // TODO(perf): scans the whole node arena per call, and the caller
-    // (`IndexCache::rescan_specs`) invokes it once per dependent index; a
-    // site→node index keyed by `(layer, path)` would make this O(matching nodes).
+    // Reaches the site's nodes through the [`path_order`](Self::path_order) site
+    // index ([`nodes_at`](Self::nodes_at)), so its cost scales with the number of
+    // nodes at the site.
     //
     // Each node's `layer_stack` handle is resolved against the live `graph`,
     // which is sound because this rescan runs only on the spec-tier
@@ -256,27 +303,43 @@ impl PrimIndex {
     // branch, which drops the cached index instead of refreshing it.
     pub(crate) fn refresh_has_specs_at(&mut self, layer: LayerId, path: &Path, graph: &LayerGraph) -> SpecRefresh {
         let mut refresh = SpecRefresh::default();
-        for node in &mut self.graph.nodes {
-            if node.path == *path && graph.layer_stack(node.layer_stack).iter().any(|&(li, _)| li == layer) {
-                let has_specs = stack_has_spec(graph, node.layer_stack, path);
-                if node.is_culled() {
-                    // An empty arc target the spec just filled in: rebuild so the
-                    // arc un-culls and grafts the target's subtree.
-                    refresh.needs_rebuild |= has_specs && !node.has_specs;
-                } else {
-                    refresh.contributing = true;
-                    // An arc target that just lost its last spec must re-cull to
-                    // match an always-empty target, so a later re-add takes the
-                    // un-cull rebuild path. The local root and inert placeholders
-                    // never cull.
-                    let lost_last_spec = node.has_specs && !has_specs;
-                    let cullable = node.arc != ArcType::Root && !node.is_inert();
-                    refresh.needs_rebuild |= lost_last_spec && cullable;
-                }
-                node.has_specs = has_specs;
+        // `to_vec` copies the small candidate run of handles, releasing the
+        // `path_order` borrow so the loop can mutate `graph.nodes` in place.
+        for id in self.nodes_at(path).to_vec() {
+            let node = &mut self.graph.nodes[id.idx()];
+            let stack = node.layer_stack;
+            if !graph.layer_stack(stack).iter().any(|&(li, _)| li == layer) {
+                continue;
             }
+            let has_specs = stack_has_spec(graph, stack, path);
+            if node.is_culled() {
+                // An empty arc target the spec just filled in: rebuild so the
+                // arc un-culls and grafts the target's subtree.
+                refresh.needs_rebuild |= has_specs && !node.has_specs;
+            } else {
+                refresh.contributing = true;
+                // An arc target that just lost its last spec must re-cull to
+                // match an always-empty target, so a later re-add takes the
+                // un-cull rebuild path. The local root and inert placeholders
+                // never cull.
+                let lost_last_spec = node.has_specs && !has_specs;
+                let cullable = node.arc != ArcType::Root && !node.is_inert();
+                refresh.needs_rebuild |= lost_last_spec && cullable;
+            }
+            node.has_specs = has_specs;
         }
         refresh
+    }
+
+    /// Arena handles of every node sitting at `path`, in path order (empty when
+    /// none) — the spec-tier refresh's candidate set. Binary-searches the
+    /// [`path_order`](Self::path_order) projection for the contiguous run of nodes
+    /// at the site.
+    fn nodes_at(&self, path: &Path) -> &[NodeId] {
+        let nodes = &self.graph.nodes;
+        let lo = self.path_order.partition_point(|&id| nodes[id.idx()].path < *path);
+        let hi = self.path_order.partition_point(|&id| nodes[id.idx()].path <= *path);
+        &self.path_order[lo..hi]
     }
 
     /// Rebuilds the memoized [`spec stack`](SpecSite): the strength-ordered
@@ -296,10 +359,10 @@ impl PrimIndex {
     /// spec-tier change refresh. It walks every strength-ordered node, gated on
     /// [`has_specs`](super::prim_graph::Node::has_specs) — a node with no spec on
     /// any member contributes nothing — and leaves the stack *unfiltered* by the
-    /// inert / culled / permission-denied flags: those are flipped after the
-    /// graph is finalized (an instance-local or permission inerting, often on a
-    /// clone), so a pre-filtered stack would go stale. Consumers apply the live
-    /// flag filter through [`live_spec_sites`](Self::live_spec_sites).
+    /// inert / culled flags: those are flipped after the graph is finalized (an
+    /// instance-local inerting, often on a clone), so a pre-filtered stack would
+    /// go stale. Consumers apply the live flag filter through
+    /// [`live_spec_sites`](Self::live_spec_sites).
     ///
     /// The folded offset is stable across the refresh and across
     /// [`rebase_root`](Self::rebase_root): the spec tier never edits
@@ -308,10 +371,11 @@ impl PrimIndex {
     ///
     /// TODO(perf): re-reads `has_spec` per member, duplicating the indexer's own
     /// `has_specs` pass — the build could emit the spec-authoring layers it
-    /// already scans. The spec-tier refresh also re-runs this once per changed
-    /// site, so an index reached by several sites in one edit rebuilds
-    /// repeatedly; a `(layer, path) → NodeId` index would splice the affected
-    /// entries once instead.
+    /// already scans. It also rebuilds the whole stack on each call; the spec-tier
+    /// refresh ([`IndexCache::rescan_specs`](super::index_cache::IndexCache::rescan_specs))
+    /// calls it once per affected index per change round, so splicing in only the
+    /// entries of the nodes a changed site touches ([`nodes_at`](Self::nodes_at))
+    /// would replace the full rebuild.
     pub(crate) fn finalize_spec_stack(&mut self, graph: &LayerGraph) {
         let mut stack = Vec::new();
         for &id in &self.graph.strength_order {
@@ -331,6 +395,27 @@ impl PrimIndex {
             }
         }
         self.spec_stack = stack;
+    }
+
+    /// Builds [`path_order`](Self::path_order) from the finalized arena: arena
+    /// handles sorted by their node's path, so the nodes at any path form a
+    /// contiguous, binary-searchable run. The sort is stable, so equal-path nodes
+    /// keep their arena order. Run once per composition alongside
+    /// [`finalize_spec_stack`](Self::finalize_spec_stack); the spec-tier refresh
+    /// changes only flags, so it reuses this projection unchanged.
+    ///
+    /// TODO(perf): built eagerly per composition (like `strength_order` and the
+    /// spec stack), so a read-only stage that never runs a spec-tier refresh — and
+    /// the common single-node prim — still pays the `Vec<NodeId>` and the sort. It
+    /// could build lazily on the first
+    /// [`refresh_has_specs_at`](Self::refresh_has_specs_at) (an empty order on a
+    /// node-bearing index signals "not yet built"), or skip the projection for
+    /// arenas small enough that a linear scan over the arena wins.
+    fn build_path_order(&mut self) {
+        let nodes = &self.graph.nodes;
+        let mut order: Vec<NodeId> = (0..nodes.len() as u32).map(NodeId).collect();
+        order.sort_by(|&a, &b| nodes[a.idx()].path.cmp(&nodes[b.idx()].path));
+        self.path_order = order;
     }
 
     /// Classifies each node as instance-local (`true`) or shared (`false`) for an
@@ -512,8 +597,16 @@ impl PrimIndex {
     #[cfg(test)]
     pub(crate) fn push_node(&mut self, node: Node) {
         let id = NodeId(self.graph.nodes.len() as u32);
+        // Keep `path_order` a valid sorted projection so a synthetic index built
+        // through this helper drives `nodes_at` and the spec-tier refresh the same
+        // way a composed one does. The new handle is the highest arena index, so it
+        // sorts after any equal-path node, matching the stable `build_path_order`.
+        let at = self
+            .path_order
+            .partition_point(|&nid| self.graph.nodes[nid.idx()].path <= node.path);
         self.graph.nodes.push(node);
         self.graph.strength_order.push(id);
+        self.path_order.insert(at, id);
     }
 
     /// Builds a prim index for a root prim with no cached ancestors (a test
@@ -522,13 +615,18 @@ impl PrimIndex {
     /// the indexer seeds a child from its cached parent.
     #[cfg(test)]
     pub(crate) fn build_with_context(path: &Path, stack: &LayerGraph, ctx: &CompositionContext) -> BuildResult<Self> {
-        Self::build_with_cache(path, stack, ctx, &sdf::PathTable::new()).map(|(index, _errors, _pending)| index)
+        Self::build_with_cache(path, stack, ctx, &sdf::PathTable::new(), true).map(|(index, _errors, _pending)| index)
     }
 
     /// Like [`build_with_context`](Self::build_with_context) but with access to
     /// previously-composed prim indices. Cached indices are checked before
     /// building from scratch, ensuring inherit/specialize targets use the
     /// fully-composed result (including ancestor-propagated specs).
+    ///
+    /// `load_payloads` is the per-path payload-inclusion decision for `path`
+    /// itself (`IndexCache::is_loaded`) — a pure function of `path`
+    /// and the stage's `pcp::LoadRules`, not something `ctx` carries, since a
+    /// sibling prim can resolve differently.
     ///
     /// The third tuple element is the [`Demand`]s a reference/payload arc raised
     /// for a target that is not yet loaded; non-empty means the returned index
@@ -539,8 +637,16 @@ impl PrimIndex {
         stack: &LayerGraph,
         ctx: &CompositionContext,
         cached_indices: &sdf::PathTable<PrimEntry>,
+        load_payloads: bool,
     ) -> BuildResult<(Self, Vec<Error>, Vec<Demand>)> {
-        Self::build_with_cache_in(path, stack, ctx, cached_indices, stack.root_layer_stack_id())
+        Self::build_with_cache_in(
+            path,
+            stack,
+            ctx,
+            cached_indices,
+            stack.root_layer_stack_id(),
+            load_payloads,
+        )
     }
 
     /// Builds a prim index whose root `L` site scans the given `ambient` layer
@@ -558,6 +664,7 @@ impl PrimIndex {
         ctx: &CompositionContext,
         cached_indices: &sdf::PathTable<PrimEntry>,
         ambient: LayerStackId,
+        load_payloads: bool,
     ) -> BuildResult<(Self, Vec<Error>, Vec<Demand>)> {
         if ambient == LayerStackId::ROOT {
             if let Some(cached) = cached_indices.get(path) {
@@ -568,7 +675,7 @@ impl PrimIndex {
         // surfaces as `Error::ArcCycle`; an unresolvable arc is recorded in the
         // returned errors and skipped. A `None` graph means an unestablished seed
         // or the runaway nesting backstop, which composes to an empty prim index.
-        let indexer = super::prim_indexer::Indexer::new(stack, ctx, cached_indices, ambient);
+        let indexer = super::prim_indexer::Indexer::new(stack, ctx, cached_indices, ambient, load_payloads);
         let super::prim_indexer::BuildOutput {
             graph,
             errors,
@@ -577,14 +684,17 @@ impl PrimIndex {
         let mut index = PrimIndex {
             graph: graph.unwrap_or_default(),
             spec_stack: Vec::new(),
+            path_order: Vec::new(),
         };
-        // Build the memoized spec stack here, the single seam every freshly
-        // composed index passes through, so value resolution reads it without a
-        // separate finalize step. The later permission / instance-local inerting
-        // only flips flags (which consumers filter live), leaving the data-derived
-        // stack valid; a materialized prototype clones an index that already
-        // carries it.
+        // Build the memoized spec stack and the path-order site index here, the
+        // single seam every freshly composed index passes through, so value
+        // resolution and the spec-tier refresh read them without a separate
+        // finalize step. The later permission / instance-local inerting only flips
+        // flags (which consumers filter live) and `rebase_root` retargets maps
+        // without moving node paths, so both projections stay valid; a
+        // materialized prototype clones an index that already carries them.
         index.finalize_spec_stack(stack);
+        index.build_path_order();
         Ok((index, errors, pending_loads))
     }
 
@@ -639,10 +749,6 @@ impl PrimIndex {
             // Inherited from the parent; the cache additionally sets this when
             // the current prim itself resolves as an instance.
             instance_depth: parent_ctx.instance_depth,
-            // Carried forward; the cache appends this prim's own denied targets.
-            denied_prefixes: parent_ctx.denied_prefixes.clone(),
-            // A stage-wide policy, propagated unchanged to every descendant.
-            load_payloads: parent_ctx.load_payloads,
         }
     }
 
@@ -702,18 +808,6 @@ pub(crate) struct CompositionContext {
     /// discarded, so the subtree composes only from the arcs the instance brings
     /// in (the instanceable arc and below, plus its implied classes).
     pub instance_depth: Option<u16>,
-    /// Target-namespace paths an ancestor's direct arc to a `permission =
-    /// private` site denied (spec 10.3.3). A node whose path lies under one of
-    /// these prefixes was reached through that denied arc, so the cache marks
-    /// it `PERMISSION_DENIED` even in descendant prims composed separately
-    /// (where the arc is extended, not authored here).
-    pub denied_prefixes: Vec<Path>,
-    /// Whether payload arcs are expanded during composition, from the stage's
-    /// [`InitialLoadSet`](crate::usd::InitialLoadSet). Propagated unchanged from
-    /// the root context to every descendant, a sibling of `variant_fallbacks`.
-    /// Defaults to `true` (C++ `UsdStage::LoadAll`); the stage sets `false` for
-    /// `LoadNone`.
-    pub load_payloads: bool,
 }
 
 impl Default for CompositionContext {
@@ -723,9 +817,6 @@ impl Default for CompositionContext {
             ancestor_arcs: Vec::new(),
             variant_fallbacks: VariantFallbackMap::new(),
             instance_depth: None,
-            denied_prefixes: Vec::new(),
-            // Compose payloads unless the stage opts out (C++ `UsdStage::LoadAll`).
-            load_payloads: true,
         }
     }
 }
@@ -946,8 +1037,8 @@ pub(crate) mod tests {
             let mut last = None;
             let mut pending: Vec<Demand> = Vec::new();
             for ancestor in &chain {
-                let (index, _errors, demands) =
-                    PrimIndex::build_with_cache(ancestor, stack, &parent_ctx, &cache).expect("index build failed");
+                let (index, _errors, demands) = PrimIndex::build_with_cache(ancestor, stack, &parent_ctx, &cache, true)
+                    .expect("index build failed");
                 pending.extend(demands);
                 parent_ctx = index.context_for_children(stack, &parent_ctx);
                 cache.insert(
@@ -956,6 +1047,7 @@ pub(crate) mod tests {
                         index: index.clone(),
                         context: CompositionContext::default(),
                         errors: Vec::new(),
+                        resolved_targets: HashMap::new(),
                     },
                 );
                 last = Some(index);
@@ -1047,6 +1139,58 @@ pub(crate) mod tests {
         let index = build(&mut stack, "/World/MyPrim");
 
         assert!(index.nodes().any(|n| n.arc == ArcType::Reference));
+        Ok(())
+    }
+
+    /// The path-order site index resolves each site to exactly the arena nodes at
+    /// that path, including a path holding several nodes (the prim site carries the
+    /// synthetic root and the local root) and the reference target at its own
+    /// namespace path, and nothing for an absent path.
+    #[test]
+    fn path_order_resolves_sites() -> Result<()> {
+        let root = parse_usda("#usda 1.0\ndef \"A\" ( references = @base.usd@</B> ) {\n  custom double x = 1\n}\n");
+        let base = parse_usda("#usda 1.0\ndef \"B\" { custom double y = 2 }\n");
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("base.usd", base)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/A");
+
+        // For every site, the index must resolve exactly the arena nodes whose path
+        // matches; a direct arena filter is the ground truth. An off-by-one in the
+        // binary-search bounds would drop a node from the run or pull in one from an
+        // adjacent path, and the exact set comparison catches either.
+        for p in ["/A", "/B"].into_iter().map(Path::from) {
+            let mut expected: Vec<NodeId> = index
+                .arena()
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.path == p)
+                .map(|(i, _)| NodeId(i as u32))
+                .collect();
+            let mut got = index.nodes_at(&p).to_vec();
+            expected.sort();
+            got.sort();
+            assert_eq!(got, expected, "site index resolves {p} to its arena nodes");
+        }
+
+        // The prim site holds more than one node (the synthetic root and the local
+        // root), so the loop above exercised the contiguous multi-node run the
+        // two-bound binary search exists to return — not just single-node sites.
+        assert!(
+            index.nodes_at(&Path::from("/A")).len() >= 2,
+            "the prim's own site carries the synthetic root and the local root"
+        );
+
+        // The reference target keeps its own namespace path /B.
+        assert!(
+            index
+                .nodes_at(&Path::from("/B"))
+                .iter()
+                .any(|&id| index.node(id).arc == ArcType::Reference),
+            "the reference node is indexed at its target path"
+        );
+
+        // An absent path resolves to no nodes.
+        assert!(index.nodes_at(&Path::from("/Nope")).is_empty());
         Ok(())
     }
 
@@ -1561,6 +1705,7 @@ def "Root" (
             &stack,
             &CompositionContext::default(),
             &sdf::PathTable::new(),
+            true,
         )?;
         assert!(
             errors.iter().any(|e| matches!(e, Error::ArcCycle(_))),
@@ -1608,6 +1753,7 @@ def "Outer"
             &stack,
             &CompositionContext::default(),
             &sdf::PathTable::new(),
+            true,
         )?;
         assert!(
             errors.iter().any(|e| matches!(e, Error::ArcCycle(_))),
@@ -1639,6 +1785,7 @@ def "Prim" (
             &stack,
             &CompositionContext::default(),
             &sdf::PathTable::new(),
+            true,
         )?;
         assert!(
             errors.iter().any(|e| matches!(e, Error::UnresolvedLayer { .. })),
@@ -1677,6 +1824,7 @@ def "Prim" (
             &stack,
             &CompositionContext::default(),
             &sdf::PathTable::new(),
+            true,
         )?;
         assert!(
             errors.iter().any(|e| matches!(e, Error::MissingDefaultPrim { .. })),

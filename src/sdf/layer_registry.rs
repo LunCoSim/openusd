@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::ar;
 use crate::sdf::{self, expr};
@@ -115,26 +115,53 @@ impl LayerRegistry {
         self.resolver.create_identifier(asset_path, anchor)
     }
 
-    /// Resolves `asset_path` against `anchor_identifier` — the identifier of the
-    /// layer it is authored in — yielding the canonical identifier of the
-    /// targeted layer. The convenience over [`create_identifier`](Self::create_identifier)
-    /// for the common case of anchoring against another layer's identifier
-    /// string rather than a pre-resolved [`ar::ResolvedPath`].
+    /// Resolves `asset_path` against `anchor_location` — the resolved real path
+    /// of the layer it is authored in (its
+    /// [`real_path`](sdf::Layer::real_path), which for a package is the
+    /// package-relative default layer, not the bare package identifier) —
+    /// yielding the canonical identifier of the targeted layer. The convenience
+    /// over [`create_identifier`](Self::create_identifier) for the common case
+    /// of anchoring against another layer's location string rather than a
+    /// pre-resolved [`ar::ResolvedPath`].
     ///
     /// TODO(perf): the resolver canonicalizes via the filesystem, so each call
     /// runs a `canonicalize`. Cache resolved identifiers per
-    /// `(anchor_identifier, asset_path)`.
-    pub(crate) fn create_identifier_anchored(&self, asset_path: &str, anchor_identifier: &str) -> String {
-        self.create_identifier(
-            asset_path,
-            Some(&ar::ResolvedPath::new(PathBuf::from(anchor_identifier))),
-        )
+    /// `(anchor_location, asset_path)`.
+    pub(crate) fn create_identifier_anchored(&self, asset_path: &str, anchor_location: &str) -> String {
+        self.create_identifier(asset_path, Some(&ar::ResolvedPath::new(PathBuf::from(anchor_location))))
     }
 
     /// Resolves an asset identifier to a physical location, or `None` if it does
     /// not exist.
     pub(crate) fn resolve(&self, identifier: &str) -> Option<ar::ResolvedPath> {
         self.resolver.resolve(identifier)
+    }
+
+    /// Resolves the layer the composition graph should open at `identifier`.
+    ///
+    /// This is [`resolve`](Self::resolve) deferred to the selected format's
+    /// [`resolve_layer`](sdf::FileFormat::resolve_layer): a package
+    /// (`pkg.usdz`) resolves to its default — first — packaged layer
+    /// (`pkg.usdz[root.usd]`), so it composes as an ordinary layer stack and
+    /// the sublayers and references authored inside it anchor in-package, while
+    /// an ordinary format keeps the resolved location. Generic
+    /// [`resolve`](Self::resolve) stays package-agnostic for asset-value
+    /// resolution and the resolvability probe, which want the package path
+    /// itself rather than a layer inside it. A resolved location no registered
+    /// format claims passes through unchanged, so [`read`](Self::read) reports
+    /// the missing format.
+    ///
+    /// The format is chosen by extension alone — unlike [`read`](Self::read),
+    /// which content-sniffs the ambiguous `.usd`. That is sound because every
+    /// `.usd` claimant keeps the identity default, so which one is picked does
+    /// not change the real path; a future `.usd` format with a non-identity
+    /// `resolve_layer` would need the content sniff here too.
+    pub(crate) fn resolve_layer(&self, identifier: &str) -> Option<ar::ResolvedPath> {
+        let resolved = self.resolver.resolve(identifier)?;
+        match Self::find_by_extension(&resolved.extension()) {
+            Some(format) => format.resolve_layer(self.resolver.as_ref(), &resolved),
+            None => Some(resolved),
+        }
     }
 
     /// The resolver's [`identity`](ar::Resolver::identity) token — the
@@ -162,7 +189,7 @@ impl LayerRegistry {
     /// `None` when it does not resolve. Used for value-clip and manifest layers,
     /// which compose outside the layer graph (spec 12.3.4).
     pub(crate) fn open(&self, identifier: &str) -> Result<Option<sdf::LayerData>> {
-        match self.resolver.resolve(identifier) {
+        match self.resolve_layer(identifier) {
             Some(resolved) => self.read(&resolved).map(Some),
             None => Ok(None),
         }
@@ -190,6 +217,15 @@ impl LayerRegistry {
     /// overlay the root's own `expressionVariables` — the ancestor, closer to the
     /// composed root, wins — and thread down the sublayer stack to evaluate its
     /// expression-valued `subLayers` paths.
+    ///
+    /// This is a pure loader: it reports every load failure raw (a missing or
+    /// unreadable sublayer, at whatever site reaches it) and knows nothing of
+    /// muting. Whether such a failure is a stage diagnostic depends on composition
+    /// reachability — a failure under a muted branch contributes nothing — which the
+    /// composition layer decides once the muted-aware graph exists (see
+    /// [`StageBuilder::make_stage`](crate::usd::Stage)). Keeping the muted policy out
+    /// of the load walk avoids attributing a diagnostic to whichever branch happened
+    /// to reach a shared layer first.
     pub(crate) fn open_stack(
         &self,
         asset_path: &str,
@@ -214,8 +250,7 @@ impl LayerRegistry {
         //
         // The root must resolve and read; both failures propagate.
         let resolved = self
-            .resolver
-            .resolve(&identifier)
+            .resolve_layer(&identifier)
             .with_context(|| format!("failed to resolve asset path: {asset_path}"))?;
         let data = self.read(&resolved)?;
         visited.insert(identifier.clone());
@@ -300,7 +335,6 @@ impl LayerRegistry {
         let mut expr_vars = expr::read_expression_variables(data.as_ref())?.into_owned();
         expr::compose_over(&mut expr_vars, ancestor_expr_vars);
 
-        let is_usdz = resolved.extension() == "usdz";
         let sub_paths = Self::sublayer_paths(data.as_ref());
 
         // Emit this layer ahead of its sublayers so the collected stack is
@@ -309,31 +343,36 @@ impl LayerRegistry {
         // reload pass an already-interned layer is re-walked (to reach a `${VAR}`
         // sublayer the new context now resolves) but not re-emitted.
         if !already_present(&identifier) {
-            layers.push(sdf::Layer::new(identifier.clone(), data));
+            layers.push(sdf::Layer::new_resolved(identifier.clone(), &resolved, data));
         }
 
-        // A layer inside a `.usdz` package cannot reach a sibling layer within the
-        // archive (not yet supported), so a usdz layer declaring any sublayers
-        // fails the open.
-        if is_usdz && !sub_paths.is_empty() {
-            bail!(
-                "cross-file references within USDZ archives are not yet supported: {}",
-                resolved
-            );
-        }
+        // Failed sublayer identifiers already reported for *this* layer, so a layer
+        // that authors the same missing/unreadable sublayer twice reports it once.
+        // Kept per referrer (not shared with the pass-wide `visited`) so a failure
+        // suppressed here never hides the same sublayer's diagnostic at another,
+        // active referrer.
+        let mut failed: HashSet<String> = HashSet::new();
 
+        // Sublayers (and references) reached from inside a `.usdz` resolve
+        // in-package: a package root is anchored to its first layer, so this
+        // layer's `resolved` is already package-relative and its sublayer paths
+        // anchor against it the same way any other layer's do.
         for sub_path in sub_paths {
             // Evaluate the (possibly expression-valued) sublayer path. An
             // unevaluable expression drops only this sublayer — like an unresolved
-            // or unreadable one — rather than failing the whole stack open.
+            // or unreadable one — rather than failing the whole stack open. It has no
+            // resolved identifier to key on, so it deduplicates per referrer by its
+            // authored path, keeping the three load-failure branches consistent.
             let sub_asset = match expr::evaluate_asset_path(&sub_path, &expr_vars) {
                 Ok(evaluated) => evaluated,
                 Err(reason) => {
-                    on_error(Error::UnreadableAsset {
-                        asset_path: sub_path,
-                        referencing_layer: identifier.clone(),
-                        reason: format!("{reason:#}"),
-                    })?;
+                    if failed.insert(sub_path.clone()) {
+                        on_error(Error::UnreadableAsset {
+                            asset_path: sub_path,
+                            referencing_layer: identifier.clone(),
+                            reason: format!("{reason:#}"),
+                        })?;
+                    }
                     continue;
                 }
             };
@@ -342,24 +381,29 @@ impl LayerRegistry {
             // A sublayer already opened this pass is skipped. One already in the
             // graph is skipped too — except in a reload pass, where it is re-walked
             // to reach the `${VAR}` sublayers the new context now resolves below it
-            // (it is not re-emitted; see the push above). An empty/degenerate
-            // identifier falls through to the resolve below as `UnresolvedAsset`.
-            if visited.contains(&sub_id) || (already_present(&sub_id) && !reload) {
+            // (it is not re-emitted; see the push above). A failure this layer
+            // already reported is skipped too. An empty/degenerate identifier falls
+            // through to the resolve below as `UnresolvedAsset`.
+            if visited.contains(&sub_id) || failed.contains(&sub_id) || (already_present(&sub_id) && !reload) {
                 continue;
             }
-            // Resolve the sublayer; a missing one is routed to `on_error`.
-            let Some(sub_resolved) = self.resolver.resolve(&sub_id) else {
+            // Resolve the sublayer; a missing one is a raw load failure reported at
+            // this referencing site. It is a leaf (no subtree to walk), so it is not
+            // added to the pass-wide `visited`: each referencing layer records its own
+            // edge, so a shared missing layer reached from several layers is reported
+            // once per referrer and the composition layer can suppress by referrer.
+            let Some(sub_resolved) = self.resolve_layer(&sub_id) else {
                 on_error(Error::UnresolvedAsset {
                     asset_path: sub_asset,
                     referencing_layer: identifier.clone(),
                 })?;
-                visited.insert(sub_id);
+                failed.insert(sub_id);
                 continue;
             };
-            visited.insert(sub_id.clone());
-            // Read the sublayer; a resolved-but-unreadable one is routed to
-            // `on_error` and skipped, dropping only it (the root's read failure
-            // propagated from `open_stack`).
+            // Read the sublayer; a resolved-but-unreadable one is a raw load failure
+            // like a missing one — reported at this referencing site and, being a
+            // leaf, left out of `visited` (dropping only this layer; the root's read
+            // failure propagated from `open_stack`).
             let sub_data = match self.read(&sub_resolved) {
                 Ok(data) => data,
                 Err(reason) => {
@@ -368,9 +412,13 @@ impl LayerRegistry {
                         referencing_layer: identifier.clone(),
                         reason: format!("{reason:#}"),
                     })?;
+                    failed.insert(sub_id);
                     continue;
                 }
             };
+            // A readable layer is interned and its subtree walked once; claim it in
+            // `visited` before recursing so a diamond or cycle does not re-emit it.
+            visited.insert(sub_id.clone());
 
             self.open_sublayers(
                 sub_id,
@@ -389,7 +437,7 @@ impl LayerRegistry {
     }
 
     /// A layer's `subLayers` asset paths (empty when it declares none).
-    fn sublayer_paths(data: &dyn sdf::AbstractData) -> Vec<String> {
+    pub(crate) fn sublayer_paths(data: &dyn sdf::AbstractData) -> Vec<String> {
         sdf::PseudoRootSpecRef::get(data)
             .and_then(|root| root.sublayers())
             .unwrap_or_default()
@@ -424,7 +472,7 @@ impl LayerRegistry {
         if identifier.is_empty() || visited.contains(&identifier) {
             return Ok(());
         }
-        let Some(resolved) = self.resolver.resolve(&identifier) else {
+        let Some(resolved) = self.resolve_layer(&identifier) else {
             return Ok(());
         };
         visited.insert(identifier.clone());
@@ -435,7 +483,7 @@ impl LayerRegistry {
             let dep_asset = expr::evaluate_asset_path(&dep, &expr_vars)?;
             self.collect_with_arcs_in(&dep_asset, Some(&resolved), &expr_vars, layers, visited)?;
         }
-        layers.push(sdf::Layer::new(identifier, data));
+        layers.push(sdf::Layer::new_resolved(identifier, &resolved, data));
         Ok(())
     }
 

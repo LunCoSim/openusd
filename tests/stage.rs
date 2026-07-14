@@ -9,8 +9,8 @@ use std::rc::Rc;
 use anyhow::Result;
 use openusd::ar::Resolver as _;
 use openusd::usd::{
-    CommittedChange, EditTarget, EditTargetArc, InitialLoadSet, PrimPredicate, PrimStatus, Stage, StageAuthoringError,
-    StagePopulationMask, StageSink,
+    CommittedChange, EditTarget, EditTargetArc, InitialLoadSet, LoadPolicy, PrimPredicate, PrimStatus, Stage,
+    StageAuthoringError, StagePopulationMask, StageSink,
 };
 use openusd::usdz::ArchiveWriter;
 use openusd::{ar, gf, pcp, sdf, tf, usd};
@@ -24,6 +24,7 @@ struct RecordingSink {
     after: Option<Box<dyn Fn(&Stage, &CommittedChange<'_>)>>,
     edit_target: Option<Box<dyn Fn(&Stage)>>,
     muting: Option<Box<dyn Fn(&Stage, &str, bool)>>,
+    load_rules: Option<Box<dyn Fn(&Stage, &[sdf::Path])>>,
 }
 
 impl StageSink for RecordingSink {
@@ -40,6 +41,11 @@ impl StageSink for RecordingSink {
     fn layer_muting_changed(&self, stage: &Stage, layer: &str, muted: bool) {
         if let Some(f) = &self.muting {
             f(stage, layer, muted);
+        }
+    }
+    fn load_rules_changed(&self, stage: &Stage, resynced: &[sdf::Path]) {
+        if let Some(f) = &self.load_rules {
+            f(stage, resynced);
         }
     }
 }
@@ -108,6 +114,21 @@ fn fwd_targets(stage: &Stage, rel: &sdf::Path) -> Result<Vec<sdf::Path>> {
     stage.relationship(rel).forwarded_targets()
 }
 
+/// Number of `UnresolvedSublayer` collection diagnostics the stage reports for
+/// `asset_path` — the assertion the muted-diagnostic tests share.
+fn unresolved_sublayer_count(stage: &Stage, asset_path: &str) -> usize {
+    stage
+        .composition_errors()
+        .iter()
+        .filter(|e| matches!(e, pcp::Error::UnresolvedSublayer { asset_path: a, .. } if a == asset_path))
+        .count()
+}
+
+/// Whether the stage reports an `UnresolvedSublayer` for `asset_path`.
+fn reports_unresolved_sublayer(stage: &Stage, asset_path: &str) -> bool {
+    unresolved_sublayer_count(stage, asset_path) > 0
+}
+
 // --- Basic stage opening (vendor/usd-wg-assets) ---
 
 #[test]
@@ -128,6 +149,276 @@ fn missing_sublayer_retained() -> Result<()> {
         } if asset_path == "missing.usda" && introduced_by.ends_with("root.usda")
     )));
     assert!(stage.prim("/Root").is_valid()?);
+    Ok(())
+}
+
+/// A missing sublayer under a muted branch raises no diagnostic: the muted layer
+/// and its whole subtree contribute nothing to composition, so its absent
+/// descendants are not stage errors. The same missing sublayer that surfaces as
+/// `UnresolvedSublayer` without the mute is filtered out with it.
+#[test]
+fn muted_branch_suppresses_missing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let muted = dir.path().join("muted.usda");
+    // `root` sublayers `muted`, which in turn sublayers a file that does not exist.
+    std::fs::write(&root, "#usda 1.0\n(\n    subLayers = [@muted.usda@]\n)\n")?;
+    std::fs::write(&muted, "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\n")?;
+    let root_path = root.to_str().unwrap();
+
+    // Without muting, the missing sublayer under `muted` is reported.
+    let plain = Stage::open(root_path)?;
+    assert!(
+        reports_unresolved_sublayer(&plain, "missing.usda"),
+        "an unmuted missing sublayer must be reported, got {:?}",
+        plain.composition_errors()
+    );
+
+    // Muting `muted.usda` prunes its subtree, so its missing sublayer is silent.
+    let muted_stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert!(
+        !reports_unresolved_sublayer(&muted_stage, "missing.usda"),
+        "a missing sublayer under a muted branch must raise no diagnostic, got {:?}",
+        muted_stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting a layer that is itself a missing sublayer suppresses its
+/// `UnresolvedSublayer` diagnostic — a muted layer contributes nothing whether it
+/// resolves or not, so its absence is not reported.
+#[test]
+fn muted_missing_sublayer_suppressed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    std::fs::write(&root, "#usda 1.0\n(\n    subLayers = [@gone.usda@]\n)\n")?;
+    let root_path = root.to_str().unwrap();
+
+    let plain = Stage::open(root_path)?;
+    assert!(
+        reports_unresolved_sublayer(&plain, "gone.usda"),
+        "an unmuted missing sublayer is reported"
+    );
+
+    let muted = Stage::builder().mute(["gone.usda"]).open(root_path)?;
+    assert!(
+        !reports_unresolved_sublayer(&muted, "gone.usda"),
+        "muting the missing sublayer suppresses its diagnostic, got {:?}",
+        muted.composition_errors()
+    );
+    Ok(())
+}
+
+/// A missing sublayer reached through both a muted and an unmuted branch of one
+/// stack is still reported. The muted branch is declared (and loaded) first, but
+/// the diagnostic decision is made from the graph's reachability, not the load
+/// order, so the unmuted branch that genuinely needs it keeps its
+/// `UnresolvedSublayer`.
+#[test]
+fn muted_diamond_keeps_active() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // `root` sublayers `muted` (declared first, so walked first) then `active`;
+    // both sublayer the same missing layer.
+    std::fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@muted.usda@, @active.usda@]\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("muted.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared_missing.usda@]\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("active.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared_missing.usda@]\n)\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    // With `muted.usda` muted, its reference to the missing layer is suppressed,
+    // but `active.usda` still contributes it, so the diagnostic must survive.
+    let stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "shared_missing.usda"),
+        1,
+        "the unmuted branch's missing sublayer must be reported exactly once, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A *readable, shared* layer reached through both a muted and an unmuted branch
+/// keeps the diagnostics for its own missing descendants. `shared` loads once
+/// (deduplicated by identity), and its missing sublayer is reported because
+/// `shared` is reachable through the unmuted `active` branch, regardless of which
+/// branch reaches it first.
+#[test]
+fn muted_diamond_keeps_descendant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Both `muted` (walked first) and `active` sublayer the same readable `shared`
+    // layer, which in turn sublayers a missing one.
+    std::fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@muted.usda@, @active.usda@]\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("muted.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("active.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("shared.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the shared layer is reachable through the unmuted branch, so its missing sublayer must be reported, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting a branch suppresses its missing-sublayer diagnostic and unmuting
+/// restores it. The loader records the raw diagnostic once; filtering happens at
+/// report time against the current composed state, so the one-shot error is never
+/// discarded and reappears when the branch rejoins composition.
+#[test]
+fn unmute_restores_diagnostic() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@muted.usda@]\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("muted.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert!(
+        !reports_unresolved_sublayer(&stage, "missing.usda"),
+        "while muted the missing sublayer must be silent, got {:?}",
+        stage.composition_errors()
+    );
+
+    stage.unmute_layer("muted.usda");
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "unmuting the branch must restore its missing-sublayer diagnostic, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// `composition_errors()` does not flicker with cache warmth: a reference
+/// target's missing-sublayer diagnostic stays reported after an unrelated mute
+/// evicts the prim index that first reached the target. The effective set is the
+/// composed stacks, not the currently-cached indices, so an eviction cannot hide a
+/// valid diagnostic. (Muting the arc's own authoring layer likewise keeps the
+/// diagnostic — a deliberate conservative over-report; see the pcp "Muted sublayer
+/// diagnostics" remaining-work note.)
+#[test]
+fn muted_diagnostic_survives_eviction() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // `/A` references `target` (which has a missing sublayer); the unrelated
+    // sublayer `s` also contributes an opinion to `/A`, so muting `s` evicts `/A`'s
+    // index without touching the `/A -> target` arc authored in the root.
+    std::fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@s.usda@]\n)\ndef \"A\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    std::fs::write(
+        dir.path().join("s.usda"),
+        "#usda 1.0\nover \"A\" {\n    custom int x = 1\n}\n",
+    )?;
+    std::fs::write(
+        dir.path().join("target.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n    defaultPrim = \"T\"\n)\ndef \"T\" {}\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::open(root_path)?;
+    let _ = child_names(&stage, "/A")?;
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the reached target's missing sublayer is reported"
+    );
+
+    // Muting the unrelated `s` evicts `/A`'s cached index; the diagnostic must not
+    // vanish with the eviction.
+    stage.mute_layer("s.usda");
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "an unrelated mute evicting the cached index must not hide the diagnostic, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting a reference target that has already loaded suppresses the target's own
+/// missing-sublayer diagnostic: the muted target root resolves to an empty stack,
+/// so it drops out of the composed-stack effective set and no longer counts as an
+/// effective referrer.
+#[test]
+fn mute_loaded_target_suppresses() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"A\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    std::fs::write(
+        dir.path().join("target.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n    defaultPrim = \"T\"\n)\ndef \"T\" {}\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::open(root_path)?;
+    // Composing `/A` loads the target and records its missing sublayer.
+    let _ = child_names(&stage, "/A")?;
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the loaded target's missing sublayer is reported"
+    );
+
+    stage.mute_layer("target.usda");
+    // Recompose `/A` so it records the now-muted target as an external target.
+    let _ = child_names(&stage, "/A")?;
+    assert!(
+        !reports_unresolved_sublayer(&stage, "missing.usda"),
+        "muting the target suppresses its own sublayer diagnostic, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A layer that authors the same missing sublayer twice reports it once. The
+/// loader deduplicates failures per referrer, so a duplicate `subLayers` entry
+/// does not double the diagnostic — while a genuinely separate referrer still
+/// reports its own (see `muted_diamond_keeps_active`).
+#[test]
+fn duplicate_missing_reported_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@, @missing.usda@]\n)\n",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "missing.usda"),
+        1,
+        "a duplicate missing sublayer is reported once, got {:?}",
+        stage.composition_errors()
+    );
     Ok(())
 }
 
@@ -367,17 +658,59 @@ fn cross_ref_expr_sublayer() -> Result<()> {
 }
 
 /// A reference authored inside a `.usdz` package targets a sibling layer in the
-/// archive, which is unsupported: composition reports the explicit
-/// [`UnsupportedUsdzReference`](pcp::Error::UnsupportedUsdzReference) error and
-/// drops the arc rather than failing the package layer as a generic unresolved
-/// target.
+/// same archive: it resolves package-relative (not against the host
+/// filesystem), so the sibling's opinion composes onto the prim and no
+/// composition error is reported.
 #[test]
-fn lazy_ref_inside_usdz_unsupported() -> Result<()> {
+fn lazy_ref_inside_usdz_resolves() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.usda");
     let package = dir.path().join("package.usdz");
     std::fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @package.usdz@\n) {}\n")?;
-    // The usdz's inner layer authors a reference to another layer.
+    // The package's first (root) layer references a sibling layer inside the
+    // same archive, which authors an opinion on the prim.
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "scene.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" (\n    references = @other.usda@\n) {}\n",
+        )?;
+        writer.add_layer(
+            "other.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom int probe = 7\n}\n",
+        )?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.prim("/P").is_valid()?, "/P composes from the package");
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the in-package reference should resolve cleanly, got {:?}",
+        stage.composition_errors()
+    );
+    assert_eq!(
+        stage
+            .attribute("/P.probe")
+            .get_at::<sdf::Value>(usd::TimeCode::new(0.0))?,
+        Some(sdf::Value::Int(7)),
+        "the sibling layer's opinion composes through the in-package reference"
+    );
+    Ok(())
+}
+
+/// A reference authored inside a `.usdz` package targets a sibling layer that
+/// is not present in the archive: the missing entry is unresolved (not merely
+/// unreadable), so composition reports
+/// [`UnresolvedLayer`](pcp::Error::UnresolvedLayer) and the rest of the prim
+/// still composes.
+#[test]
+fn lazy_ref_inside_usdz_missing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("package.usdz");
+    std::fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @package.usdz@\n) {}\n")?;
+    // The package's first layer references a sibling that is never added.
     {
         let mut writer = ArchiveWriter::create(&package)?;
         writer.add_layer(
@@ -392,11 +725,112 @@ fn lazy_ref_inside_usdz_unsupported() -> Result<()> {
     assert!(
         stage.composition_errors().iter().any(|error| matches!(
             error,
-            pcp::Error::UnsupportedUsdzReference { asset_path, introduced_by, .. }
-                if asset_path.ends_with("other.usda") && introduced_by.ends_with("package.usdz")
+            pcp::Error::UnresolvedLayer { asset_path, .. } if asset_path.ends_with("other.usda]")
         )),
-        "expected UnsupportedUsdzReference, got {:?}",
+        "expected UnresolvedLayer for the missing in-package target, got {:?}",
         stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A reference to a present-but-empty `.usdz` (no packaged USD layer) reports a
+/// [`MalformedLayer`](pcp::Error::MalformedLayer) carrying the real reason —
+/// the package resolved but could not be read — rather than being silently
+/// dropped as a missing asset or surfacing a "failed to resolve" diagnostic.
+#[test]
+fn lazy_ref_empty_usdz_malformed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("empty.usdz");
+    std::fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @empty.usdz@\n) {}\n")?;
+    // A valid ZIP archive with no packaged USD layer.
+    ArchiveWriter::create(&package)?.finish()?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.prim("/P").is_valid()?, "/P still composes from its own opinion");
+    assert!(
+        stage.composition_errors().iter().any(|error| matches!(
+            error,
+            pcp::Error::MalformedLayer { asset_path, reason, .. }
+                if asset_path.ends_with("empty.usdz") && reason.contains("USDZ archive")
+        )),
+        "expected MalformedLayer with the package read reason, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A `.usdz` whose default (first) layer sits in a sub-directory references a
+/// sibling by a relative path. The reference must anchor against the package's
+/// real path (the package-relative default layer,
+/// `pkg.usdz[Scenes/root.usda]`),
+/// not the bare package identifier, so the sibling resolves at
+/// `pkg.usdz[Scenes/other.usda]` and its opinion composes.
+#[test]
+fn usdz_subdir_first_layer_anchors() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("package.usdz");
+    std::fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @package.usdz@\n) {}\n")?;
+    // Both packaged layers live under `Scenes/`; the first is the default layer.
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "Scenes/root.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" (\n    references = @other.usda@\n) {}\n",
+        )?;
+        writer.add_layer(
+            "Scenes/other.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom int probe = 9\n}\n",
+        )?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the sub-directory in-package reference should resolve cleanly, got {:?}",
+        stage.composition_errors()
+    );
+    assert_eq!(
+        stage
+            .attribute("/P.probe")
+            .get_at::<sdf::Value>(usd::TimeCode::new(0.0))?,
+        Some(sdf::Value::Int(9)),
+        "the sibling under Scenes/ composes through the in-package reference"
+    );
+    Ok(())
+}
+
+/// An `asset`-valued attribute pointing at a `.usdz` package resolves to the
+/// package path itself, not a path anchored into the package's first layer:
+/// the asset is the package, and consumers key on the package path.
+#[test]
+fn asset_value_usdz_is_package_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("model.usdz");
+    std::fs::write(&root, "#usda 1.0\ndef \"P\" {\n    custom asset a = @model.usdz@\n}\n")?;
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer("root.usda", b"#usda 1.0\ndef \"M\" {}\n")?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let value = stage
+        .attribute("/P.a")
+        .get_at::<sdf::Value>(usd::TimeCode::new(0.0))?
+        .expect("asset value resolves");
+    let asset = value.try_as_asset_path().expect("attribute is asset-typed");
+    let resolved = asset.resolved_path().expect("asset path is resolved");
+    assert!(
+        resolved.ends_with("model.usdz"),
+        "asset value should resolve to the bare package path, got {resolved:?}",
+    );
+    assert!(
+        !resolved.contains('['),
+        "asset value must not be anchored into the package, got {resolved:?}",
     );
     Ok(())
 }
@@ -867,6 +1301,133 @@ fn open_with_session() -> Result<Stage> {
     let root = fixture_path("session_root.usda");
     let session = fixture_path("session_layer.usda");
     Stage::builder().session_layer(&session).open(&root)
+}
+
+/// A `${VAR}` sublayer in the root layer resolves against an expression variable
+/// authored only on the session layer, and the named layer is loaded from disk:
+/// the session is part of the root layer stack, so its variables seed the root's
+/// sublayer collection, not just an already-interned lookup.
+#[test]
+fn session_var_loads_sublayer() -> Result<()> {
+    let root = fixture_path("session_expr_sublayer/root.usda");
+    let session = fixture_path("session_expr_sublayer/session.usda");
+    let stage = Stage::builder().session_layer(&session).open(&root)?;
+    assert_eq!(
+        stage.attribute("/A.x").get::<f64>()?,
+        Some(1.0),
+        "the session WHICH variable loads and resolves the root's expression sublayer"
+    );
+    Ok(())
+}
+
+/// Muting a session layer at open time prunes its whole sublayer subtree from the
+/// variables that drive root `${VAR}` sublayer collection, not just the exact
+/// layer: `strong.usda` (muted) sublayers `vars.usda` (WHICH="b"), `weak.usda`
+/// authors WHICH="a", so muting `strong` must compose WHICH="a" and open a.usda —
+/// the weaker opinion's sublayer — not the muted subtree's b.usda.
+#[test]
+fn muted_session_collects_sublayer() -> Result<()> {
+    let root = fixture_path("session_expr_mute/root.usda");
+    let session = fixture_path("session_expr_mute/session.usda");
+    let stage = Stage::builder()
+        .session_layer(&session)
+        .mute([fixture_path("session_expr_mute/strong.usda")])
+        .open(&root)?;
+    assert_eq!(
+        stage.attribute("/A.x").get::<f64>()?,
+        Some(1.0),
+        "muting the stronger session opinion composes the weaker's root sublayer (a.usda)"
+    );
+    Ok(())
+}
+
+/// A muted session subtree is pruned after resolving its expression-valued
+/// sublayer paths with the session stack variables. The descendant `vars.usda`
+/// must not contribute `WHICH=b` after `strong.usda` is muted.
+#[test]
+fn muted_session_expr_subtree() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    let strong = dir.path().join("strong.usda");
+    std::fs::write(&root, "#usda 1.0\n(\n    subLayers = [@`\"${WHICH}.usda\"`@]\n)\n")?;
+    std::fs::write(
+        &session,
+        "#usda 1.0\n(\n    expressionVariables = {\n        string CHILD = \"vars\"\n    }\n    subLayers = [@strong.usda@, @weak.usda@]\n)\n",
+    )?;
+    std::fs::write(&strong, "#usda 1.0\n(\n    subLayers = [@`\"${CHILD}.usda\"`@]\n)\n")?;
+    std::fs::write(
+        dir.path().join("vars.usda"),
+        "#usda 1.0\n(\n    expressionVariables = {\n        string WHICH = \"b\"\n    }\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0\n(\n    expressionVariables = {\n        string WHICH = \"a\"\n    }\n)\n",
+    )?;
+    std::fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n",
+    )?;
+    std::fs::write(
+        dir.path().join("b.usda"),
+        "#usda 1.0\ndef \"A\" {\n    custom double x = 2\n}\n",
+    )?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().expect("utf-8 temp path"))
+        .mute([strong.to_str().expect("utf-8 temp path")])
+        .open(root.to_str().expect("utf-8 temp path"))?;
+    assert_eq!(
+        stage.attribute("/A.x").get::<f64>()?,
+        Some(1.0),
+        "the muted expression subtree's WHICH=b does not select b.usda"
+    );
+    Ok(())
+}
+
+/// Open-time muted session paths are anchored against the resolved root layer,
+/// not the bare package path. A packaged root whose default layer is
+/// `dir/root.usda` therefore mutes `dir/strong.usda` for a relative
+/// `mute("strong.usda")` request.
+#[test]
+fn packaged_root_mute_anchor() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let package = dir.path().join("package.usdz");
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "dir/root.usda",
+            b"#usda 1.0\n(\n    subLayers = [@`\"${WHICH}.usda\"`@]\n)\n",
+        )?;
+        writer.add_layer(
+            "dir/session.usda",
+            b"#usda 1.0\n(\n    subLayers = [@strong.usda@, @weak.usda@]\n)\n",
+        )?;
+        writer.add_layer(
+            "dir/strong.usda",
+            b"#usda 1.0\n(\n    expressionVariables = {\n        string WHICH = \"b\"\n    }\n)\n",
+        )?;
+        writer.add_layer(
+            "dir/weak.usda",
+            b"#usda 1.0\n(\n    expressionVariables = {\n        string WHICH = \"a\"\n    }\n)\n",
+        )?;
+        writer.add_layer("dir/a.usda", b"#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n")?;
+        writer.add_layer("dir/b.usda", b"#usda 1.0\ndef \"A\" {\n    custom double x = 2\n}\n")?;
+        writer.finish()?;
+    }
+
+    let package = package.to_string_lossy();
+    let session = format!("{package}[dir/session.usda]");
+    let stage = Stage::builder()
+        .session_layer(session)
+        .mute(["strong.usda"])
+        .open(&package)?;
+    assert_eq!(
+        stage.attribute("/A.x").get::<f64>()?,
+        Some(1.0),
+        "mute(\"strong.usda\") is anchored relative to the packaged root layer"
+    );
+    Ok(())
 }
 
 /// A stage opened without a session layer should report no session layer.
@@ -1522,6 +2083,45 @@ fn muted_reference_target_not_opened() -> Result<()> {
     Ok(())
 }
 
+/// Unmuting a reference target that was muted *before it ever loaded* recomposes
+/// the referrer: the arc was skipped at the demand point (the target never
+/// interned, so the layer-keyed mute fanout cannot find the referrer), and the
+/// unmute fans out by the target's canonical identifier instead — dropping the
+/// stale index so the load barrier finally opens the target on the next query.
+#[test]
+fn unmute_unloaded_reference_recomposes() -> Result<()> {
+    let path = composition_path("references/reference_same_folder.usda");
+    let target = composition_path("references/_stage.usda");
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let muted_id = ar::DefaultResolver::new().create_identifier(&target, None);
+    let stage = Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .mute([muted_id.clone()])
+        .open(&path)?;
+
+    // While muted, the reference is skipped and its target is never opened, so
+    // `/World` composes with no referenced children.
+    assert_eq!(child_names(&stage, "/World")?, Vec::<String>::new());
+    assert!(
+        !opened.borrow().iter().any(|p| p.contains("_stage.usda")),
+        "a muted reference target must never be opened"
+    );
+
+    // Unmuting the never-loaded target must recompose `/World`: the load barrier
+    // opens the target on demand and the reference brings in its children.
+    stage.unmute_layer(&muted_id);
+    assert_eq!(
+        child_names(&stage, "/World")?,
+        vec!["Cube"],
+        "unmuting a never-loaded reference target recomposes the referrer"
+    );
+    assert!(
+        opened.borrow().iter().any(|p| p.contains("_stage.usda")),
+        "unmuting must let the load barrier open the now-unmuted target"
+    );
+    Ok(())
+}
+
 #[test]
 fn load_none() -> Result<()> {
     let path = composition_path("payload/payload_same_folder.usda");
@@ -1536,7 +2136,7 @@ fn load_none() -> Result<()> {
     assert_eq!(loaded.layer_count(), 2);
 
     let unloaded = Stage::builder().load(InitialLoadSet::LoadNone).open(&path)?;
-    assert_eq!(unloaded.load(), InitialLoadSet::LoadNone);
+    assert_eq!(unloaded.initial_load_set(), InitialLoadSet::LoadNone);
     assert_eq!(unloaded.layer_count(), 1);
     assert!(!unloaded.prim("/World").is_loaded()?);
     assert_eq!(child_names(&unloaded, "/World")?, Vec::<String>::new());
@@ -1544,6 +2144,285 @@ fn load_none() -> Result<()> {
     let mut prims = Vec::new();
     unloaded.traverse(PrimPredicate::DEFAULT, |p| prims.push(p.as_str().to_string()))?;
     assert!(prims.is_empty());
+    Ok(())
+}
+
+/// Runtime `load`/`unload` mutate the effective load state incrementally,
+/// independent of the stage's open-time `InitialLoadSet`.
+#[test]
+fn runtime_load_unload() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::builder().load(InitialLoadSet::LoadNone).open(&path)?;
+    assert!(!stage.prim("/World").is_loaded()?);
+
+    stage.load("/World", LoadPolicy::WithDescendants);
+    assert!(stage.prim("/World").is_loaded()?);
+    assert_eq!(child_names(&stage, "/World")?, vec!["Cube"]);
+
+    stage.unload("/World");
+    assert!(!stage.prim("/World").is_loaded()?);
+    assert_eq!(child_names(&stage, "/World")?, Vec::<String>::new());
+    Ok(())
+}
+
+/// `set_load_rules` installs a caller-built table wholesale, and `load_rules`
+/// reads back exactly what was installed.
+#[test]
+fn set_load_rules_round_trips() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::open(&path)?;
+
+    let mut rules = pcp::LoadRules::all();
+    rules.unload(sdf::path("/World")?);
+    stage.set_load_rules(rules.clone());
+
+    assert_eq!(stage.load_rules(), rules);
+    assert!(!stage.prim("/World").is_loaded()?);
+    Ok(())
+}
+
+/// A redundant `load`/`unload` call — one that resolves to the same load
+/// rules already in effect — fires no [`StageSink::load_rules_changed`]
+/// notification, since nothing was actually invalidated.
+#[test]
+fn load_noop_fires_no_notification() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::open(&path)?;
+    let calls = Rc::new(RefCell::new(0));
+    let _token = {
+        let calls = calls.clone();
+        stage.add_sink(RecordingSink {
+            load_rules: Some(Box::new(move |_stage, _resynced| {
+                *calls.borrow_mut() += 1;
+            })),
+            ..Default::default()
+        })
+    };
+
+    // Already loaded with the default (empty) rules -- a true no-op.
+    stage.load("/World", LoadPolicy::WithDescendants);
+    assert_eq!(
+        *calls.borrow(),
+        0,
+        "already-loaded path with default rules fires nothing"
+    );
+
+    stage.unload("/World");
+    assert_eq!(*calls.borrow(), 1);
+
+    stage.unload("/World");
+    assert_eq!(*calls.borrow(), 1, "repeated unload is a no-op");
+    Ok(())
+}
+
+/// Writes a three-layer payload chain (`root` -> `/World/A` payloads `a.usda`
+/// -> `/World/A/Deep` payloads `deep.usda`) into a fresh temp directory, for
+/// tests exercising nested load-rule interactions.
+fn write_nested_payload_scene(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let root = dir.join("root.usda");
+    let a = dir.join("a.usda");
+    let deep = dir.join("deep.usda");
+    std::fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"A\" (\n        payload = @a.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &a,
+        "#usda 1.0\n(\n    defaultPrim = \"A\"\n)\ndef \"A\" {\n    def \"Deep\" (\n        payload = @deep.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &deep,
+        "#usda 1.0\n(\n    defaultPrim = \"Deep\"\n)\ndef \"Deep\" {\n    custom double x = 42\n}\n",
+    )?;
+    Ok(root)
+}
+
+/// `find_loadable` discovers every payload-carrying prim under `root`, even
+/// one nested behind another payload it must transiently load to see past,
+/// and restores the stage's original (unloaded) state afterward. `load_set`
+/// then reports only what the live rules actually include.
+#[test]
+fn nested_payload_find_loadable_and_load_set() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(root.to_str().unwrap())?;
+
+    assert_eq!(
+        stage.find_loadable("/World")?,
+        vec![sdf::path("/World/A")?, sdf::path("/World/A/Deep")?]
+    );
+    assert!(stage.load_set()?.is_empty(), "load rules still say LoadNone");
+    // The transient discovery swap must not leave the rules changed.
+    assert!(!stage.prim("/World/A").is_loaded()?);
+
+    stage.load("/World/A", LoadPolicy::WithDescendants);
+    assert_eq!(
+        stage.load_set()?,
+        vec![sdf::path("/World/A")?, sdf::path("/World/A/Deep")?]
+    );
+    Ok(())
+}
+
+/// `load_and_unload` applies every unload before any load, so a path in both
+/// sets ends up loaded.
+#[test]
+fn load_and_unload_same_path_prefers_load() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+
+    stage.load_and_unload(
+        [(sdf::path("/World/A")?, LoadPolicy::WithDescendants)],
+        [sdf::path("/World/A")?],
+    );
+    assert!(stage.prim("/World/A").is_loaded()?);
+    Ok(())
+}
+
+/// Unloading an ancestor while loading one of its descendants in the same
+/// `load_and_unload` call still leaves the descendant reachable: the
+/// ancestor's own payload reopens just enough to expose it (`Rule::Only` via
+/// `LoadRules::effective_rule`'s lookahead).
+#[test]
+fn load_and_unload_nested_ancestor_descendant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+
+    stage.load_and_unload(
+        [(sdf::path("/World/A/Deep")?, LoadPolicy::WithDescendants)],
+        [sdf::path("/World/A")?],
+    );
+    assert!(stage.prim("/World/A").is_loaded()?);
+    assert!(stage.prim("/World/A/Deep").is_loaded()?);
+    assert_eq!(
+        stage
+            .attribute("/World/A/Deep.x")
+            .get_at::<sdf::Value>(usd::TimeCode::new(0.0))?,
+        Some(sdf::Value::Double(42.0))
+    );
+    Ok(())
+}
+
+/// Two instances sharing identical arcs mint one prototype by default; giving
+/// one instance's descendant a different runtime load rule than the other's
+/// splits them into separate prototypes (`InstanceKey` folds in each
+/// instance's own load rules, re-rooted onto its path).
+#[test]
+fn instance_descendant_load_rule_splits_prototype() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    let heavy = dir.path().join("heavy.usda");
+    std::fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"InstA\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n    def \"InstB\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {\n    def \"Heavy\" (\n        payload = @heavy.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &heavy,
+        "#usda 1.0\n(\n    defaultPrim = \"Heavy\"\n)\ndef \"Heavy\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let proto_a = stage.prim("/World/InstA").prototype()?.expect("InstA is an instance");
+    let proto_b = stage.prim("/World/InstB").prototype()?.expect("InstB is an instance");
+    assert_eq!(
+        proto_a, proto_b,
+        "identical composition and load state share a prototype"
+    );
+
+    stage.unload("/World/InstA/Heavy");
+
+    let proto_a = stage.prim("/World/InstA").prototype()?.expect("still an instance");
+    let proto_b = stage.prim("/World/InstB").prototype()?.expect("still an instance");
+    assert_ne!(
+        proto_a, proto_b,
+        "differing load rules on a descendant split the prototype"
+    );
+    Ok(())
+}
+
+/// A caller-supplied `set_load_rules` table naming a synthetic
+/// `/__Prototype_N` path directly is stripped before it is stored: load rules
+/// are only ever meaningful in real-instance-namespace terms (see
+/// `instance_descendant_load_rule_splits_prototype`), and unlike `load`/
+/// `unload`, a raw `set_load_rules` call has no other gate against it.
+#[test]
+fn set_load_rules_strips_prototype_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    std::fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"Inst\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let prototype = stage.prim("/World/Inst").prototype()?.expect("Inst is an instance");
+
+    let mut rules = pcp::LoadRules::all();
+    rules.unload(prototype);
+    stage.set_load_rules(rules);
+
+    assert!(
+        stage.load_rules().is_empty(),
+        "the prototype-rooted rule must never be stored"
+    );
+    Ok(())
+}
+
+/// `Prim::is_loaded` gives the same answer whether reached through an
+/// instance's own path or through the shared prototype's synthetic path —
+/// both route through the prototype's stored relative load rules, not the
+/// global table (which never carries prototype-rooted entries).
+#[test]
+fn is_loaded_through_prototype_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    let heavy = dir.path().join("heavy.usda");
+    std::fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"Inst\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {\n    def \"Heavy\" (\n        payload = @heavy.usda@\n    ) {}\n}\n",
+    )?;
+    std::fs::write(
+        &heavy,
+        "#usda 1.0\n(\n    defaultPrim = \"Heavy\"\n)\ndef \"Heavy\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let prototype = stage.prim("/World/Inst").prototype()?.expect("Inst is an instance");
+    let proto_heavy = prototype.append_path("Heavy")?;
+
+    assert!(
+        stage.prim(&proto_heavy).is_loaded()?,
+        "loaded by default before any unload"
+    );
+
+    stage.unload("/World/Inst/Heavy");
+
+    assert!(
+        !stage.prim("/World/Inst/Heavy").is_loaded()?,
+        "unloaded through the instance's own path"
+    );
+    assert!(
+        !stage.prim(&proto_heavy).is_loaded()?,
+        "the prototype's own path must report the same, not the previous unconditional loaded"
+    );
     Ok(())
 }
 
@@ -3699,12 +4578,321 @@ fn override_prim() -> Result<()> {
     Ok(())
 }
 
+// --- Incremental invalidation: per-field change classification ---
+
+/// Authoring `permission = private` on an inherited class is inert metadata:
+/// composition never enforces it (C++'s counterpart is compiled out for
+/// `Usd`-mode caches), so the inherited opinion keeps resolving unchanged and no
+/// recompose is needed.
+#[test]
+fn permission_edit_does_not_inert_opinion() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    std::fs::write(
+        &root,
+        "#usda 1.0\n\ndef \"Class\"\n{\n    custom double attr = 5\n}\n\ndef \"Inst\" (\n    inherits = </Class>\n)\n{\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/Inst.attr").get::<sdf::Value>()?,
+        Some(sdf::Value::Double(5.0)),
+        "the inherited opinion contributes before the permission edit",
+    );
+
+    stage.prim("/Class").set_metadata(
+        sdf::FieldKey::Permission.as_str(),
+        sdf::Value::Permission(sdf::Permission::Private),
+    )?;
+
+    assert_eq!(
+        stage.attribute("/Inst.attr").get::<sdf::Value>()?,
+        Some(sdf::Value::Double(5.0)),
+        "permission is inert metadata; the inherited opinion still resolves",
+    );
+    Ok(())
+}
+
+/// Authoring `clips` on a prim that had none is read live through the cached
+/// index's spec sites — clips need no classifier entry, since every value view
+/// rebuilds against the revision bump. The authored clip set overrides the
+/// reference's time samples once present (spec 12.3.4.5).
+#[test]
+fn clips_edit_resolves_live() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let clip = dir.path().join("clip.usda");
+    let manifest = dir.path().join("manifest.usda");
+    let referenced = dir.path().join("ref.usda");
+    std::fs::write(
+        &clip,
+        "#usda 1.0\n\ndef \"Model\"\n{\n    double size.timeSamples = {\n        0: 0,\n        10: 10,\n    }\n}\n",
+    )?;
+    std::fs::write(&manifest, "#usda 1.0\n\ndef \"Model\"\n{\n    double size\n}\n")?;
+    std::fs::write(
+        &referenced,
+        "#usda 1.0\n\ndef \"Model\"\n{\n    double size.timeSamples = {\n        0: -1,\n        10: -10,\n    }\n}\n",
+    )?;
+    std::fs::write(
+        &root,
+        format!(
+            "#usda 1.0\n\ndef \"Model\" (\n    references = @{}@</Model>\n)\n{{\n}}\n",
+            referenced.display()
+        ),
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        value_f64(&stage, "/Model.size", 10.0),
+        Some(-10.0),
+        "the reference time sample resolves before any clips are authored",
+    );
+
+    let prim = stage.prim("/Model");
+    let api = usd::ClipsAPI::new(&prim);
+    api.set_clip_asset_paths("default", vec![clip.display().to_string()])?;
+    api.set_clip_prim_path("default", "/Model")?;
+    api.set_clip_manifest_asset_path("default", manifest.display().to_string())?;
+    api.set_clip_active("default", vec![gf::vec2d(0.0, 0.0)])?;
+
+    assert_eq!(
+        value_f64(&stage, "/Model.size", 10.0),
+        Some(10.0),
+        "the authored clip set overrides the reference time sample",
+    );
+    Ok(())
+}
+
+/// The cache memoizes a relationship's resolved targets on first query; editing
+/// its `targetPaths` must drop that memo so the next query recomposes them.
+/// Regression guard for the property-tier (`did_change_targets`) consumer.
+#[test]
+fn target_edit_drops_memo() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage.define_prim("/C")?;
+    stage
+        .prim("/A")
+        .create_relationship("r")?
+        .set_targets([sdf::path("/B")?])?;
+
+    // First query populates the memo.
+    assert_eq!(stage.relationship("/A.r").targets()?, vec![sdf::path("/B")?]);
+
+    stage.relationship("/A.r").set_targets([sdf::path("/C")?])?;
+    assert_eq!(
+        stage.relationship("/A.r").targets()?,
+        vec![sdf::path("/C")?],
+        "the re-authored targets must be visible, not the memoized list",
+    );
+    Ok(())
+}
+
+/// A relationship inherited from a class translates the class's targets into the
+/// inheriting prim's namespace. Editing the class relationship must fan out to
+/// the inheriting prim's memo (a referenced site's edit restales the translated
+/// targets), not just the class's own.
+#[test]
+fn target_edit_fans_out_to_dependent() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Class")?;
+    stage.define_prim("/Class/Local")?;
+    stage.define_prim("/Class/Other")?;
+    stage
+        .prim("/Class")
+        .create_relationship("r")?
+        .set_targets([sdf::path("/Class/Local")?])?;
+    stage.define_prim("/Inst")?.set_metadata(
+        sdf::FieldKey::InheritPaths.as_str(),
+        sdf::Value::PathListOp(sdf::PathListOp::prepended([sdf::path("/Class")?])),
+    )?;
+    stage.define_prim("/Inst/Local")?;
+    stage.define_prim("/Inst/Other")?;
+
+    // First query memoizes the inherited relationship's translated targets.
+    assert_eq!(
+        stage.relationship("/Inst.r").targets()?,
+        vec![sdf::path("/Inst/Local")?],
+        "the inherited target translates into the instance namespace",
+    );
+
+    stage
+        .relationship("/Class.r")
+        .set_targets([sdf::path("/Class/Other")?])?;
+    assert_eq!(
+        stage.relationship("/Inst.r").targets()?,
+        vec![sdf::path("/Inst/Other")?],
+        "editing the class relationship restales the inheriting prim's memo",
+    );
+    Ok(())
+}
+
+/// Removing the relationship spec that authored the memoized targets must drop
+/// the memo so the next query recomposes. The removal carries only
+/// `REMOVE_PROPERTY`, so the producer surfaces the removed `targetPaths` to route
+/// it through `did_change_targets`; without that the stale `[/B]` would persist.
+#[test]
+fn target_spec_removal_drops_memo() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage
+        .prim("/A")
+        .create_relationship("r")?
+        .set_targets([sdf::path("/B")?])?;
+
+    // Populate the memo.
+    assert_eq!(stage.relationship("/A.r").targets()?, vec![sdf::path("/B")?]);
+
+    assert!(stage.remove_property("/A.r")?);
+    assert_eq!(
+        stage.relationship("/A.r").targets()?,
+        Vec::<sdf::Path>::new(),
+        "the removed relationship's memoized targets must not persist",
+    );
+    Ok(())
+}
+
+/// A relationship-target value edit is a changed-info edit on the property, not a
+/// whole-prim resync: the change notice's `resynced` must not name the owning
+/// prim, while `changed_info_only` names the edited relationship.
+#[test]
+fn target_edit_is_info_only_not_resync() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage.define_prim("/C")?;
+    stage
+        .prim("/A")
+        .create_relationship("r")?
+        .set_targets([sdf::path("/B")?])?;
+
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let (resynced, info) = (resynced.clone(), info.clone());
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+        })
+    };
+    stage.relationship("/A.r").set_targets([sdf::path("/C")?])?;
+
+    assert!(
+        !resynced.borrow().contains(&sdf::path("/A")?),
+        "a target value edit must not resync the owning prim"
+    );
+    assert!(
+        info.borrow().contains(&sdf::path("/A.r")?),
+        "the edited relationship is reported as changed-info"
+    );
+    Ok(())
+}
+
+/// Removing an attribute is a structural removal, not a changed-info edit: the
+/// removed property must not appear in `changed_info_only`, where a consumer
+/// reading its value would find it gone.
+#[test]
+fn attr_removal_not_info_only() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.create_attribute("/P.size", "double")?;
+
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let info = info.clone();
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+        })
+    };
+    assert!(stage.remove_property("/P.size")?);
+
+    assert!(
+        !info.borrow().contains(&sdf::path("/P.size")?),
+        "a removed attribute must not be reported as a changed-info edit"
+    );
+    Ok(())
+}
+
+/// Removing a relationship that had authored targets surfaces its `targetPaths`
+/// for memo invalidation, but that internal signal must not surface the gone
+/// property as a changed-info edit — the removal is structural, not info-only.
+#[test]
+fn rel_removal_not_info_only() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage
+        .prim("/A")
+        .create_relationship("r")?
+        .set_targets([sdf::path("/B")?])?;
+
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let info = info.clone();
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+        })
+    };
+    assert!(stage.remove_property("/A.r")?);
+
+    assert!(
+        !info.borrow().contains(&sdf::path("/A.r")?),
+        "a removed relationship with targets must not be reported as a changed-info edit"
+    );
+    Ok(())
+}
+
+/// A connection authored in a class that targets an instance of that class is
+/// dropped per `_TargetInClassAndTargetsInstance` — a decision that composes the
+/// target prim to read its instance status. The resolved list must not be served
+/// from a stale memo after the target prim's instance status changes. `Owner` and
+/// `Target` are top-level siblings, so editing `Target` does not fan out to drop
+/// `Owner`'s index (their only common ancestor is the pseudo-root); the memo
+/// itself must recognize it read cross-prim instance state and resolve live.
+#[test]
+fn instance_target_memo_not_stale() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    std::fs::write(
+        &root,
+        "#usda 1.0\n\nclass \"Class\"\n{\n    double x\n    add double x.connect = [</Target.y>]\n    double y\n}\n\n\
+         def \"Owner\" (\n    inherits = </Class>\n)\n{\n}\n\ndef \"Target\" (\n    inherits = </Class>\n)\n{\n}\n",
+    )?;
+    let attr = "/Owner.x";
+    let target = sdf::path("/Target")?;
+    let drop_inherit = || sdf::Value::PathListOp(sdf::PathListOp::explicit(Vec::<sdf::Path>::new()));
+
+    // Stage A: query first (populating any memo). `Target` is an instance of
+    // `Class`, so the class connection to it is dropped. Then drop `Target`'s
+    // inherit so it is no longer an instance, and re-query.
+    let a = Stage::open(root.to_str().unwrap())?;
+    let before = a.attribute(attr).connections()?;
+    a.prim(target.clone())
+        .set_metadata(sdf::FieldKey::InheritPaths.as_str(), drop_inherit())?;
+    let after_cached = a.attribute(attr).connections()?;
+
+    // Stage B: apply the same edit before any query, so its result is composed
+    // from scratch with no memo in play.
+    let b = Stage::open(root.to_str().unwrap())?;
+    b.prim(target)
+        .set_metadata(sdf::FieldKey::InheritPaths.as_str(), drop_inherit())?;
+    let fresh = b.attribute(attr).connections()?;
+
+    assert_eq!(after_cached, fresh, "the cached path must agree with a fresh compose");
+    assert_ne!(
+        before, after_cached,
+        "the edit must change the result (guards against a vacuous test)"
+    );
+    Ok(())
+}
+
 // --- Adapted from in-module tests: value resolution, existence, authoring ---
 
-/// A direct arc to a `permission = private` site is retained as a
-/// composition error while the prim still composes (spec 10.3.3).
+/// A direct arc to a `permission = private` site composes normally:
+/// `permission` is inert metadata for composition (spec 10.3.3), matching C++'s
+/// own arc/target permission enforcement, which is compiled out for `Usd`-mode
+/// caches and therefore never runs for a `UsdStage`.
 #[test]
-fn arc_permission_denied_surfaced() -> Result<()> {
+fn permission_private_inherit_composes_normally() -> Result<()> {
     let path = format!(
         "{}/vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/\
              ErrorPermissionDenied_root/usda/root.usd",
@@ -3712,7 +4900,8 @@ fn arc_permission_denied_surfaced() -> Result<()> {
     );
     let stage = Stage::builder().open(&path)?;
 
-    // Querying /Model composes the private inherit and retains the error.
+    // /Model inherits the private /_PrivateClass; the inherited opinion stays
+    // visible and composing it raises no error.
     assert!(
         stage
             .prim("/Model")
@@ -3722,11 +4911,8 @@ fn arc_permission_denied_surfaced() -> Result<()> {
         "private inherit must stay visible"
     );
     assert!(
-        stage
-            .composition_errors()
-            .iter()
-            .any(|error| matches!(error, pcp::Error::ArcPermissionDenied { .. })),
-        "composition_errors should contain the permission error"
+        stage.composition_errors().is_empty(),
+        "permission = private must not raise a composition error"
     );
 
     Ok(())
