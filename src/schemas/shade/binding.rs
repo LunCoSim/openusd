@@ -50,6 +50,22 @@ impl MaterialBindingAPI {
         get_with_api(stage, path, &[API_MATERIAL_BINDING]).map(|o| o.map(Self))
     }
 
+    /// Wrap the prim at `path` **without requiring the schema to be applied** —
+    /// C++ `UsdShadeMaterialBindingAPI(prim)`, whose constructor is valid on any
+    /// prim.
+    ///
+    /// Use this to *read* or *resolve* bindings; use [`apply`](Self::apply) when
+    /// you intend to *author* one. The distinction is not cosmetic: bindings
+    /// inherit down namespace, so the prim you query (a mesh deep inside a rover)
+    /// normally authors no binding — and therefore no `apiSchemas` entry — while
+    /// the binding that governs it lives on an ancestor. [`get`](Self::get) returns
+    /// `None` for exactly that prim, so resolving through it would silently drop
+    /// every *inherited* binding, which is the common case rather than the corner
+    /// case.
+    pub fn on(stage: &Stage, path: impl Into<Path>) -> Self {
+        Self(stage.prim(path.into()))
+    }
+
     /// Author an all-purpose **direct** binding (`material:binding`) targeting
     /// `material` (C++ `UsdShadeMaterialBindingAPI::Bind`).
     pub fn bind(&self, material: impl Into<Path>) -> Result<&Self> {
@@ -397,6 +413,31 @@ mod tests {
             .compute_bound_material(purpose)
             .unwrap()
             .map(|p| p.as_str().to_string())
+    }
+
+    /// `on()` resolves a binding the queried prim only *inherits* — the common
+    /// case, and the one `get()` cannot serve: the mesh authors no binding, so it
+    /// carries no `MaterialBindingAPI` in `apiSchemas` and `get()` returns `None`.
+    /// Resolving through `get()` would therefore silently drop every inherited
+    /// binding.
+    #[test]
+    fn on_resolves_an_inherited_binding_without_the_schema_applied() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        stage.define_prim("/Set")?.set_type_name("Xform")?;
+        stage.define_prim("/Set/Mesh")?.set_type_name("Mesh")?;
+        MaterialBindingAPI::apply(&stage, sdf::path("/Set")?)?.bind(sdf::path("/MatA")?)?;
+
+        // The mesh never had the schema applied…
+        assert!(
+            MaterialBindingAPI::get(&stage, "/Set/Mesh")?.is_none(),
+            "the mesh authors no binding, so it carries no MaterialBindingAPI"
+        );
+        // …yet it is governed by the ancestor's binding, and `on()` finds it.
+        assert_eq!(
+            MaterialBindingAPI::on(&stage, sdf::path("/Set/Mesh")?).compute_bound_material("")?,
+            Some(sdf::path("/MatA")?)
+        );
+        Ok(())
     }
 
     #[test]
