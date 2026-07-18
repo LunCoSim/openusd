@@ -196,6 +196,22 @@ pub const A_V_RANGE: &str = "vRange";
 pub const A_U_FORM: &str = "uForm";
 pub const A_V_FORM: &str = "vForm";
 
+// NurbsPatch trim-curve attribute names.
+//
+// Trim curves cut a rectangular NURBS patch. They are rational **2D** curves in
+// the patch's own `(u, v)` parameter space, joined into closed loops; the loops
+// decide which regions of the domain survive. That is how a NURBS surface gets a
+// hole — the surface equation is untouched, part of its domain is discarded.
+//
+// `nCurves` below means the total curve count across all loops:
+// `sum(trimCurve:counts)`.
+pub const A_TRIM_CURVE_COUNTS: &str = "trimCurve:counts";
+pub const A_TRIM_CURVE_ORDERS: &str = "trimCurve:orders";
+pub const A_TRIM_CURVE_VERTEX_COUNTS: &str = "trimCurve:vertexCounts";
+pub const A_TRIM_CURVE_KNOTS: &str = "trimCurve:knots";
+pub const A_TRIM_CURVE_RANGES: &str = "trimCurve:ranges";
+pub const A_TRIM_CURVE_POINTS: &str = "trimCurve:points";
+
 // NurbsPatch form token values.
 pub const PATCH_FORM_OPEN: &str = "open";
 pub const PATCH_FORM_CLOSED: &str = "closed";

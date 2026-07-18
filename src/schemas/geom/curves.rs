@@ -410,6 +410,108 @@ impl NurbsPatch {
         Ok(self.create_attribute(tok::A_V_RANGE, "double2")?.set_custom(false)?)
     }
 
+    /// The number of curves in each closed **loop** of the trim; the array's length is the number
+    /// of loops and its sum is the total curve count (`nCurves`) that sizes every other trim
+    /// attribute.
+    /// C++ `UsdGeomNurbsPatch::GetTrimCurveCountsAttr`.
+    ///
+    /// Trim curves are rational **2D** curves in this patch's own `(u, v)` parameter space. The
+    /// loops they form decide which regions of the domain survive — that is how a NURBS surface
+    /// gets a hole without its surface equation changing.
+    ///
+    /// Type `int[]`. Fetch with `get::<sdf::Value>()?` (a `sdf::Value::IntVec`).
+    pub fn trim_curve_counts_attr(&self) -> Attribute {
+        self.attribute(tok::A_TRIM_CURVE_COUNTS)
+    }
+
+    /// Author `trimCurve:counts` (`int[]`) (C++ `CreateTrimCurveCountsAttr`).
+    pub fn create_trim_curve_counts_attr(&self) -> Result<Attribute> {
+        Ok(self
+            .create_attribute(tok::A_TRIM_CURVE_COUNTS, "int[]")?
+            .set_custom(false)?)
+    }
+
+    /// Flat list of orders, one per curve (`nCurves` entries).
+    /// C++ `UsdGeomNurbsPatch::GetTrimCurveOrdersAttr`.
+    ///
+    /// Type `int[]`. Fetch with `get::<sdf::Value>()?`.
+    pub fn trim_curve_orders_attr(&self) -> Attribute {
+        self.attribute(tok::A_TRIM_CURVE_ORDERS)
+    }
+
+    /// Author `trimCurve:orders` (`int[]`) (C++ `CreateTrimCurveOrdersAttr`).
+    pub fn create_trim_curve_orders_attr(&self) -> Result<Attribute> {
+        Ok(self
+            .create_attribute(tok::A_TRIM_CURVE_ORDERS, "int[]")?
+            .set_custom(false)?)
+    }
+
+    /// Flat list of control-point counts, one per curve (`nCurves` entries); its sum is the length
+    /// of `trimCurve:points`.
+    /// C++ `UsdGeomNurbsPatch::GetTrimCurveVertexCountsAttr`.
+    ///
+    /// Type `int[]`. Fetch with `get::<sdf::Value>()?`.
+    pub fn trim_curve_vertex_counts_attr(&self) -> Attribute {
+        self.attribute(tok::A_TRIM_CURVE_VERTEX_COUNTS)
+    }
+
+    /// Author `trimCurve:vertexCounts` (`int[]`) (C++ `CreateTrimCurveVertexCountsAttr`).
+    pub fn create_trim_curve_vertex_counts_attr(&self) -> Result<Attribute> {
+        Ok(self
+            .create_attribute(tok::A_TRIM_CURVE_VERTEX_COUNTS, "int[]")?
+            .set_custom(false)?)
+    }
+
+    /// Flat list of knots for all curves; its length is
+    /// `sum(trimCurve:vertexCounts) + sum(trimCurve:orders)`.
+    /// C++ `UsdGeomNurbsPatch::GetTrimCurveKnotsAttr`.
+    ///
+    /// Type `double[]`. Fetch with `get::<Vec<f64>>()?`.
+    pub fn trim_curve_knots_attr(&self) -> Attribute {
+        self.attribute(tok::A_TRIM_CURVE_KNOTS)
+    }
+
+    /// Author `trimCurve:knots` (`double[]`) (C++ `CreateTrimCurveKnotsAttr`).
+    pub fn create_trim_curve_knots_attr(&self) -> Result<Attribute> {
+        Ok(self
+            .create_attribute(tok::A_TRIM_CURVE_KNOTS, "double[]")?
+            .set_custom(false)?)
+    }
+
+    /// Flat list of `(min, max)` parametric ranges, one per curve, as defined by
+    /// `trimCurve:knots`.
+    /// C++ `UsdGeomNurbsPatch::GetTrimCurveRangesAttr`.
+    ///
+    /// Type `double2[]`. Fetch with `get::<Vec<gf::Vec2d>>()?`.
+    pub fn trim_curve_ranges_attr(&self) -> Attribute {
+        self.attribute(tok::A_TRIM_CURVE_RANGES)
+    }
+
+    /// Author `trimCurve:ranges` (`double2[]`) (C++ `CreateTrimCurveRangesAttr`).
+    pub fn create_trim_curve_ranges_attr(&self) -> Result<Attribute> {
+        Ok(self
+            .create_attribute(tok::A_TRIM_CURVE_RANGES, "double2[]")?
+            .set_custom(false)?)
+    }
+
+    /// Flat list of homogeneous **2D** control points `(u, v, w)` in the patch's parameter space —
+    /// `w` is the rational weight, **not** a third spatial axis. That is what lets a trim loop be
+    /// an exact circle, which is what a porthole or a bolt hole actually is. Length equals
+    /// `sum(trimCurve:vertexCounts)`.
+    /// C++ `UsdGeomNurbsPatch::GetTrimCurvePointsAttr`.
+    ///
+    /// Type `double3[]`. Fetch with `get::<Vec<gf::Vec3d>>()?`.
+    pub fn trim_curve_points_attr(&self) -> Attribute {
+        self.attribute(tok::A_TRIM_CURVE_POINTS)
+    }
+
+    /// Author `trimCurve:points` (`double3[]`) (C++ `CreateTrimCurvePointsAttr`).
+    pub fn create_trim_curve_points_attr(&self) -> Result<Attribute> {
+        Ok(self
+            .create_attribute(tok::A_TRIM_CURVE_POINTS, "double3[]")?
+            .set_custom(false)?)
+    }
+
     /// The rational weight of each control point, making the surface a rational NURBS; one value
     /// per point and parallel to `points`. Omit (or leave all 1.0) for a non-rational patch.
     /// C++ `UsdGeomNurbsPatch::GetPointWeightsAttr`.
@@ -432,6 +534,7 @@ impl_geom_schema!(pointbased NurbsPatch);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gf;
 
     #[test]
     fn basis_curves_roundtrip() -> Result<()> {
@@ -515,6 +618,77 @@ mod tests {
         let p = NurbsPatch::get(&stage, "/P")?.expect("NurbsPatch");
         assert_eq!(p.u_vertex_count_attr().get()?, Some(sdf::Value::Int(4)));
         assert_eq!(p.u_form_attr().get()?, Some(sdf::Value::Token("periodic".into())));
+        Ok(())
+    }
+
+    /// Trim curves round-trip, and the size invariants that relate the six
+    /// attributes hold.
+    ///
+    /// The invariants are the whole contract — get one wrong and a trim is
+    /// silently misread rather than rejected:
+    ///   `counts.len()`      = number of closed loops
+    ///   `sum(counts)`       = nCurves = `orders.len()` = `vertexCounts.len()`
+    ///   `points.len()`      = `sum(vertexCounts)`
+    ///   `knots.len()`       = `sum(vertexCounts) + sum(orders)`
+    ///   `ranges.len()`      = nCurves
+    ///
+    /// One square loop of 4 order-2 curves — the shape a porthole cut actually is.
+    #[test]
+    fn trim_curve_round_trips_with_its_size_invariants() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        let p = NurbsPatch::define(&stage, "/P")?;
+
+        // 1 loop of 4 curves, each order 2 with 2 control points.
+        let counts = vec![4_i32];
+        let orders = vec![2_i32; 4];
+        let vertex_counts = vec![2_i32; 4];
+        // 2 CVs + order 2 = 4 knots per curve.
+        let knots: Vec<f64> = (0..4).flat_map(|_| [0.0, 0.0, 1.0, 1.0]).collect();
+        let ranges: Vec<gf::Vec2d> = (0..4).map(|_| gf::vec2d(0.0, 1.0)).collect();
+        // Homogeneous 2D (u, v, w) — `w` is the rational WEIGHT, not a third axis.
+        let points: Vec<gf::Vec3d> = [
+            (0.0, 0.0), (1.0, 0.0), // bottom
+            (1.0, 0.0), (1.0, 1.0), // right
+            (1.0, 1.0), (0.0, 1.0), // top
+            (0.0, 1.0), (0.0, 0.0), // left
+        ]
+        .iter()
+        .map(|(u, v)| gf::vec3d(*u, *v, 1.0))
+        .collect();
+
+        p.create_trim_curve_counts_attr()?.set(sdf::Value::IntVec(counts.clone()))?;
+        p.create_trim_curve_orders_attr()?.set(sdf::Value::IntVec(orders.clone()))?;
+        p.create_trim_curve_vertex_counts_attr()?
+            .set(sdf::Value::IntVec(vertex_counts.clone()))?;
+        p.create_trim_curve_knots_attr()?.set(knots.clone())?;
+        p.create_trim_curve_ranges_attr()?.set(ranges.clone())?;
+        p.create_trim_curve_points_attr()?.set(points.clone())?;
+
+        let p = NurbsPatch::get(&stage, "/P")?.expect("NurbsPatch");
+        assert_eq!(
+            p.trim_curve_counts_attr().get()?,
+            Some(sdf::Value::IntVec(counts.clone()))
+        );
+        assert_eq!(
+            p.trim_curve_orders_attr().get()?,
+            Some(sdf::Value::IntVec(orders.clone()))
+        );
+        assert_eq!(
+            p.trim_curve_vertex_counts_attr().get()?,
+            Some(sdf::Value::IntVec(vertex_counts.clone()))
+        );
+        assert_eq!(p.trim_curve_knots_attr().get::<Vec<f64>>()?, Some(knots.clone()));
+        assert_eq!(p.trim_curve_ranges_attr().get::<Vec<gf::Vec2d>>()?, Some(ranges));
+        assert_eq!(p.trim_curve_points_attr().get::<Vec<gf::Vec3d>>()?, Some(points.clone()));
+
+        // The invariants themselves.
+        let n_curves: i32 = counts.iter().sum();
+        assert_eq!(n_curves as usize, orders.len());
+        assert_eq!(n_curves as usize, vertex_counts.len());
+        let sum_cv: i32 = vertex_counts.iter().sum();
+        let sum_ord: i32 = orders.iter().sum();
+        assert_eq!(points.len(), sum_cv as usize);
+        assert_eq!(knots.len(), (sum_cv + sum_ord) as usize);
         Ok(())
     }
 }
