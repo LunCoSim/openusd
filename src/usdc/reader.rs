@@ -21,6 +21,18 @@ use crate::{
 
 use super::layout::*;
 
+/// Maximum dictionary nesting a crate file may declare.
+///
+/// `read_custom_data` recurses through `value()`, which re-enters it for a nested
+/// `Type::Dictionary` — one Rust stack frame per level, over data the file
+/// chooses. Without a ceiling a small crafted layer nests until the stack
+/// overflows, and a stack overflow is an immediate abort: not a `Result` anyone
+/// can catch, so it cannot be handled at any layer above.
+///
+/// 128 is far past anything authored — real `customData`/`assetInfo` nests a
+/// handful deep — while staying well inside the default 8 MiB stack.
+const MAX_DICT_DEPTH: usize = 128;
+
 // Maximum supported USDC crate version.
 // See USD Core Specification v1.0.1 §16.3.8.2 for version history:
 //   0.10.0 — Path Expression value types
@@ -50,6 +62,11 @@ pub struct CrateFile<R> {
     pub paths: Vec<sdf::Path>,
     // All specs.
     pub specs: Vec<Spec>,
+
+    /// Current dictionary nesting depth, guarding the `read_custom_data` ->
+    /// `value` -> `read_custom_data` recursion against a file-controlled stack
+    /// overflow. See [`MAX_DICT_DEPTH`].
+    dict_depth: usize,
 }
 
 impl<R> CrateFile<R> {
@@ -75,6 +92,7 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
             fieldsets: Vec::new(),
             paths: Vec::new(),
             specs: Vec::new(),
+            dict_depth: 0,
         };
 
         file.read_sections().context("Unable to read sections")?;
@@ -111,6 +129,18 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
 
                 anyhow::Ok(())
             })?;
+
+        // STRINGS is an indirection into TOKENS, and `resolve_string` indexes both
+        // without checking. Validating the whole table here keeps that resolution
+        // infallible by construction rather than making every caller handle a
+        // `Result` for a condition that is decidable once, at load.
+        self.strings.iter().enumerate().try_for_each(|(index, &token)| {
+            self.tokens
+                .get(token)
+                .with_context(|| format!("Invalid string {index} token index: {token}"))?;
+
+            anyhow::Ok(())
+        })?;
 
         self.specs.iter().enumerate().try_for_each(|(index, spec)| {
             self.paths
@@ -333,7 +363,17 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
             todo!("Support PATHS reader for < 0.4.0 files");
         } else {
             // Read # of paths.
+            //
+            // Bounded before it is believed: `sdf::Path` is not `Pod`, so this
+            // cannot go through `read_vec`'s grow-as-you-read path and the whole
+            // table is reserved up front. A crafted count here was a direct OOM.
             let path_count = self.reader.read_count()?;
+            let ceiling = self.remaining_bytes()?;
+            ensure!(
+                path_count as u64 <= ceiling,
+                "PATHS declares {path_count} paths but only {ceiling} bytes remain; \
+                 refusing to allocate the path table",
+            );
             self.paths = vec![sdf::Path::default(); path_count];
 
             self.read_compressed_paths()?;
@@ -387,6 +427,13 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
             return Ok(());
         }
 
+        // EVERY SUBSCRIPT BELOW IS FILE-CONTROLLED. `index` walks forward with no
+        // bound of its own, `jumps[index]` steers `sibling_index` anywhere at all,
+        // and `path_indexes[index]` addresses the path table directly — so a
+        // crafted PATHS section could walk any of these arrays off the end and take
+        // the process down with an index panic. Each access is resolved through
+        // `.get()` and reported instead; a malformed layer must fail to load, not
+        // abort the host.
         let mut pending = vec![(0usize, sdf::Path::default())];
 
         while let Some((mut current_index, mut parent_path)) = pending.pop() {
@@ -394,39 +441,76 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
                 let index = current_index;
                 current_index += 1;
 
+                // One bounds check covering the three parallel arrays, which
+                // `read_compressed_paths` reads at the same `count`.
+                let jump = *jumps
+                    .get(index)
+                    .with_context(|| format!("PATHS node index {index} out of range ({} nodes)", jumps.len()))?;
+
                 if parent_path.is_empty() {
                     parent_path = sdf::Path::new("/")?;
-                    self.paths[index] = parent_path.clone();
+                    let slot = self
+                        .paths
+                        .get_mut(index)
+                        .with_context(|| format!("PATHS root slot {index} out of range"))?;
+                    *slot = parent_path.clone();
                 } else {
-                    let token_index = element_token_indexes[index];
+                    let token_index = *element_token_indexes
+                        .get(index)
+                        .with_context(|| format!("PATHS token index slot {index} out of range"))?;
                     let is_prim_property_path = token_index < 0;
                     let token_index = token_index.unsigned_abs() as usize;
-                    let element_token = self.tokens[token_index].as_str();
+                    let element_token = self.token_at(token_index)?.as_str().to_owned();
 
-                    self.paths[path_indexes[index] as usize] = if is_prim_property_path {
-                        parent_path.append_property(element_token)?
+                    let target = *path_indexes
+                        .get(index)
+                        .with_context(|| format!("PATHS target slot {index} out of range"))? as usize;
+
+                    let built = if is_prim_property_path {
+                        parent_path.append_property(&element_token)?
                     } else if element_token.starts_with('{') {
                         // Variant segments are appended directly without a separator
                         // to produce canonical paths like /Prim{set=sel}.
-                        parent_path.append_variant_segment(element_token)
+                        parent_path.append_variant_segment(&element_token)
                     } else {
-                        parent_path.append_path(element_token)?
+                        parent_path.append_path(element_token.as_str())?
                     };
+
+                    let total = self.paths.len();
+                    let slot = self
+                        .paths
+                        .get_mut(target)
+                        .with_context(|| format!("PATHS target index {target} out of range ({total} paths)"))?;
+                    *slot = built;
                 }
 
-                let has_child = jumps[index] > 0 || jumps[index] == -1;
-                let has_sibling = jumps[index] >= 0;
+                let has_child = jump > 0 || jump == -1;
+                let has_sibling = jump >= 0;
 
                 if has_child {
                     if has_sibling {
-                        let sibling_index = index + jumps[index] as usize;
+                        // A jump is a forward offset; anything that leaves the table
+                        // is malformed, and `checked_add` also refuses the overflow
+                        // a hostile value could otherwise wrap through.
+                        let sibling_index = index
+                            .checked_add(jump as usize)
+                            .with_context(|| format!("PATHS sibling jump from {index} overflowed"))?;
+                        ensure!(
+                            sibling_index < jumps.len(),
+                            "PATHS sibling jump from {index} lands at {sibling_index}, past the {} nodes",
+                            jumps.len(),
+                        );
                         // Siblings share this node's parent; defer the subtree.
                         pending.push((sibling_index, parent_path.clone()));
                     }
 
                     // Descend into the child (the next sequential entry) under
                     // this node's path.
-                    parent_path = self.paths[path_indexes[index] as usize].clone();
+                    let target = *path_indexes
+                        .get(index)
+                        .with_context(|| format!("PATHS target slot {index} out of range"))?
+                        as usize;
+                    parent_path = self.path_at(target)?.clone();
                 }
 
                 if !has_child && !has_sibling {
@@ -483,14 +567,63 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
         self.sections.iter().find(|s| s.name() == name)
     }
 
-    fn resolve_string(&self, string_index: u32) -> String {
-        let token = self.strings[string_index as usize];
-        self.tokens[token].clone()
+    /// A STRINGS-table entry resolved through to its token.
+    ///
+    /// Fallible on the SUBSCRIPT, not on the indirection: `validate()` proves every
+    /// stored `strings` entry points at a real token, but `string_index` itself
+    /// arrives from a value payload at unpack time and is not covered by that pass.
+    fn resolve_string(&self, string_index: u32) -> Result<String> {
+        let token = *self.strings.get(string_index as usize).with_context(|| {
+            format!("String index {string_index} out of range ({} strings)", self.strings.len())
+        })?;
+        Ok(self.token_at(token)?.clone())
+    }
+
+    /// A token by index, refused rather than panicked on when out of range.
+    ///
+    /// The indices these guard do NOT come from the structural tables `validate()`
+    /// checks at load — they are read lazily out of VALUE payloads at unpack time,
+    /// long after validation, so there is no earlier point at which they could have
+    /// been proven in range. A crafted payload naming token 2^31 reached a direct
+    /// `self.tokens[...]` and took the process down with an index panic; a parser
+    /// for untrusted input has to return an error there instead.
+    fn token_at(&self, index: usize) -> Result<&String> {
+        self.tokens
+            .get(index)
+            .with_context(|| format!("Token index {index} out of range ({} tokens)", self.tokens.len()))
+    }
+
+    /// A path by index, refused rather than panicked on when out of range.
+    /// Same lazily-read provenance as [`Self::token_at`].
+    fn path_at(&self, index: usize) -> Result<&sdf::Path> {
+        self.paths
+            .get(index)
+            .with_context(|| format!("Path index {index} out of range ({} paths)", self.paths.len()))
     }
 
     fn set_position(&mut self, position: u64) -> Result<()> {
         self.reader.seek(io::SeekFrom::Start(position))?;
         Ok(())
+    }
+
+    /// Bytes remaining from the current position — the hard ceiling on any element
+    /// count the file declares about itself.
+    ///
+    /// No table can hold more entries than the stream has bytes left to describe
+    /// them with, whatever its length prefix claims, so this bounds the counts that
+    /// drive allocations of NON-`Pod` elements. (`Pod` vectors are already safe:
+    /// [`ReadExt::read_vec`] grows with the bytes actually delivered. Types like
+    /// `sdf::Path` cannot go through that path and would otherwise be reserved in
+    /// full before a single byte is validated.)
+    ///
+    /// One byte per entry is deliberately generous — every real encoding costs
+    /// several — because the goal is to convert an unbounded allocation into a
+    /// bounded one, not to police the format.
+    fn remaining_bytes(&mut self) -> Result<u64> {
+        let pos = self.reader.stream_position()?;
+        let end = self.reader.seek(io::SeekFrom::End(0))?;
+        self.reader.seek(io::SeekFrom::Start(pos))?;
+        Ok(end.saturating_sub(pos))
     }
 
     fn unpack_value<T: Default + Pod>(&mut self, value: ValueRep) -> Result<T> {
@@ -516,7 +649,7 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
 
     fn read_token(&mut self, value: ValueRep) -> Result<String> {
         let index: u64 = self.unpack_value(value)?;
-        let value = self.tokens[index as usize].clone();
+        let value = self.token_at(index as usize)?.clone();
 
         Ok(value)
     }
@@ -530,9 +663,9 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
     fn read_asset_path(&mut self, value: ValueRep) -> Result<String> {
         let index = self.unpack_value::<u32>(value)?;
         if value.is_inlined() {
-            Ok(self.tokens[index as usize].clone())
+            Ok(self.token_at(index as usize)?.clone())
         } else {
-            Ok(self.resolve_string(index))
+            self.resolve_string(index)
         }
     }
 
@@ -545,10 +678,36 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
     /// # Arguments:
     /// - `estimated_size`: Size enough to hold uncompressed data.
     fn read_compressed<T: Default + NoUninit + AnyBitPattern>(&mut self, estimated_count: usize) -> Result<Vec<T>> {
-        // Read data to memory.
+        // Read data to memory. `read_vec` grows with the bytes actually delivered,
+        // so a `compressed_size` larger than the file fails on the short read
+        // instead of reserving its claim first.
         let compressed_size = self.reader.read_count()?;
-        let mut input = vec![0_u8; compressed_size];
-        self.reader.read_exact(&mut input)?;
+        let input = self.reader.read_vec::<u8>(compressed_size)?;
+
+        // DECOMPRESSION BOMB BOUND. `estimated_count` is derived from a count in
+        // the file and describes the buffer the payload says it will expand into —
+        // nothing has checked it against the payload that actually arrived. Left
+        // unbounded it is the same OOM as an over-large `read_count`, only reached
+        // through the compressed path: a few KiB of input can name a multi-GiB
+        // output buffer, and the allocation happens before `decompress_lz4` gets a
+        // chance to disagree.
+        //
+        // LZ4's block format cannot expand by more than 255x (the maximum a single
+        // match can cover per token), so input length times that ratio is a hard
+        // ceiling no legitimate stream can exceed. Anything above it is malformed
+        // by construction, and rejecting it costs well-formed files nothing.
+        const MAX_LZ4_EXPANSION: usize = 255;
+        let elem = mem::size_of::<T>();
+        ensure!(elem > 0, "Refusing to decompress into zero-sized elements");
+        let declared_bytes = estimated_count.saturating_mul(elem);
+        let ceiling = input.len().saturating_mul(MAX_LZ4_EXPANSION);
+        ensure!(
+            declared_bytes <= ceiling,
+            "Declared uncompressed size ({declared_bytes} bytes) exceeds the maximum \
+             LZ4 expansion of the {} compressed bytes actually read (ceiling {ceiling}); \
+             refusing to allocate",
+            input.len(),
+        );
 
         // Decompress to output buffer.
         let mut output = vec![T::default(); estimated_count];
@@ -738,23 +897,32 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
 
     /// Reads a count-prefixed vector of `u32` indices and maps each through
     /// `lookup` to produce the element value.
-    fn read_indexed_vec<T>(&mut self, lookup: impl Fn(&Self, usize) -> T) -> Result<Vec<T>> {
+    /// `lookup` is fallible because the indices it receives come from the file:
+    /// every one of them is a table subscript a crafted stream can point past the
+    /// end, so resolution has to be able to refuse.
+    fn read_indexed_vec<T>(&mut self, lookup: impl Fn(&Self, usize) -> Result<T>) -> Result<Vec<T>> {
         let count = self.reader.read_count()?;
         let indices = self.reader.read_vec::<u32>(count)?;
 
-        Ok(indices.into_iter().map(|index| lookup(self, index as usize)).collect())
+        indices.into_iter().map(|index| lookup(self, index as usize)).collect()
     }
 
     fn read_string_vec(&mut self) -> Result<Vec<String>> {
-        self.read_indexed_vec(|file, index| file.tokens[file.strings[index]].clone())
+        self.read_indexed_vec(|file, index| {
+            let token = *file
+                .strings
+                .get(index)
+                .with_context(|| format!("String index {index} out of range ({} strings)", file.strings.len()))?;
+            Ok(file.token_at(token)?.clone())
+        })
     }
 
     fn read_token_vec(&mut self) -> Result<Vec<String>> {
-        self.read_indexed_vec(|file, index| file.tokens[index].clone())
+        self.read_indexed_vec(|file, index| Ok(file.token_at(index)?.clone()))
     }
 
     fn read_path_vec(&mut self) -> Result<Vec<sdf::Path>> {
-        self.read_indexed_vec(|file, index| file.paths[index].clone())
+        self.read_indexed_vec(|file, index| Ok(file.path_at(index)?.clone()))
     }
 
     /// Reads a count-prefixed vector of POD values.
@@ -765,14 +933,14 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
 
     fn read_string(&mut self) -> Result<String> {
         let index = self.reader.read_pod::<u32>()?;
-        let string = self.resolve_string(index);
+        let string = self.resolve_string(index)?;
 
         Ok(string)
     }
 
     fn read_path(&mut self) -> Result<sdf::Path> {
         let index = self.reader.read_pod::<u32>()?;
-        let path = self.paths[index as usize].clone();
+        let path = self.path_at(index as usize)?.clone();
 
         Ok(path)
     }
@@ -828,12 +996,23 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
     /// Reads a crate dictionary value (`customData`, `assetInfo`, and nested
     /// dictionaries).
     ///
-    /// TODO: this recurses through `value`, which re-enters here for a nested
-    /// `Type::Dictionary`, so a deeply nested dictionary overflows the stack —
-    /// one Rust frame per nesting level over file-controlled data. Bound the
-    /// depth (a guard or an explicit stack), as `build_compressed_paths` does
-    /// for wide path trees.
+    /// Recurses through `value`, which re-enters here for a nested
+    /// `Type::Dictionary` — one Rust frame per nesting level, over file-controlled
+    /// data — so the depth is bounded by [`MAX_DICT_DEPTH`]. The counter is
+    /// restored on every exit path, including the error paths below, so one
+    /// rejected dictionary does not poison the sibling that follows it.
     fn read_custom_data(&mut self) -> Result<HashMap<String, Value>> {
+        ensure!(
+            self.dict_depth < MAX_DICT_DEPTH,
+            "Dictionary nesting exceeds the maximum depth of {MAX_DICT_DEPTH}; refusing to recurse",
+        );
+        self.dict_depth += 1;
+        let result = self.read_custom_data_inner();
+        self.dict_depth -= 1;
+        result
+    }
+
+    fn read_custom_data_inner(&mut self) -> Result<HashMap<String, Value>> {
         let mut count = self.reader.read_count()?;
         let mut dict = HashMap::default();
 
@@ -992,7 +1171,7 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
                 ensure!(!value.is_array());
 
                 let string_index = self.unpack_value::<u32>(value)?;
-                sdf::Value::String(self.resolve_string(string_index))
+                sdf::Value::String(self.resolve_string(string_index)?)
             }
             Type::AssetPath if value.is_array() => {
                 // Asset arrays (`asset[]`, e.g. value-clip `assetPaths`) are
@@ -1008,8 +1187,8 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
                 let indices = self.reader.read_vec::<u32>(count)?;
                 let tokens = indices
                     .into_iter()
-                    .map(|i| self.tokens[i as usize].as_str().into())
-                    .collect();
+                    .map(|i| Ok(self.token_at(i as usize)?.as_str().into()))
+                    .collect::<Result<Vec<_>>>()?;
 
                 sdf::Value::TokenVec(tokens)
             }
@@ -1430,8 +1609,8 @@ impl<R: io::Read + io::Seek> CrateFile<R> {
                 for _ in 0..count {
                     let src_idx: u32 = self.reader.read_pod()?;
                     let tgt_idx: u32 = self.reader.read_pod()?;
-                    let src = self.paths[src_idx as usize].clone();
-                    let tgt = self.paths[tgt_idx as usize].clone();
+                    let src = self.path_at(src_idx as usize)?.clone();
+                    let tgt = self.path_at(tgt_idx as usize)?.clone();
                     pairs.push((src, tgt));
                 }
                 sdf::Value::Relocates(pairs)
@@ -1533,9 +1712,51 @@ impl<R: io::Read> ReadExt for R {
             return Ok(Vec::new());
         }
 
-        let mut vec = vec![T::default(); count];
-        self.read_exact(cast_slice_mut(&mut vec))
-            .context("Unable to read vec")?;
+        // GROW AS THE DATA ARRIVES — never allocate `count` up front.
+        //
+        // `count` reaches here straight from `read_count()`, i.e. a `u64` read
+        // verbatim out of the file with nothing yet validated. A single crafted
+        // header field therefore used to name its own allocation: `vec![T; 1<<60]`
+        // aborts the process before one byte of payload is examined, so a ~40-byte
+        // `.usdc` (or a `.usdz` member) is a remote OOM against anything that opens
+        // an untrusted stage.
+        //
+        // Reading in bounded chunks makes the peak allocation a function of the
+        // bytes the stream ACTUALLY supplied rather than of the number it claims:
+        // an over-large `count` now fails on the first short `read_exact` with at
+        // most `MAX_CHUNK_ELEMS` elements committed. Well-formed files are
+        // unaffected apart from a few extra `resize_with` calls on large arrays.
+        //
+        // This is the choke point for the whole family — `read_pod_vec`,
+        // `read_vec_array` and the compressed-array paths all land here — which is
+        // why the bound lives at the primitive instead of at each call site, where
+        // it would be one forgotten site away from useless.
+        const MAX_CHUNK_BYTES: usize = 1 << 20; // 1 MiB of payload per step
+
+        let elem = mem::size_of::<T>();
+        // A zero-sized element carries no payload, so chunking cannot converge and
+        // the count is pure allocation — refuse rather than spin.
+        ensure!(elem > 0, "Refusing to read a vec of zero-sized elements");
+
+        let chunk = (MAX_CHUNK_BYTES / elem).max(1);
+        let mut vec: Vec<T> = Vec::new();
+        let mut remaining = count;
+
+        while remaining > 0 {
+            let n = remaining.min(chunk);
+            let start = vec.len();
+            vec.resize_with(start + n, T::default);
+            self.read_exact(cast_slice_mut(&mut vec[start..]))
+                .with_context(|| {
+                    format!(
+                        "Unable to read vec of {count} x {} ({} bytes declared); \
+                         stream ended after {start} elements",
+                        type_name::<T>(),
+                        count.saturating_mul(elem),
+                    )
+                })?;
+            remaining -= n;
+        }
 
         Ok(vec)
     }
@@ -1545,6 +1766,48 @@ impl<R: io::Read> ReadExt for R {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A declared count far larger than the stream must FAIL, not allocate.
+    ///
+    /// The whole family of `read_count`-driven reads funnels through `read_vec`,
+    /// and it used to open with `vec![T::default(); count]` — so eight bytes of
+    /// header naming `u64::MAX / 8` aborted the process on an allocation the file
+    /// had merely asserted. This pins the grow-as-you-read behaviour: the error is
+    /// the point, and reaching it at all proves nothing huge was reserved first.
+    #[test]
+    fn an_oversized_count_is_refused_not_allocated() {
+        // Eight elements claimed, four bytes supplied.
+        let data: Vec<u8> = vec![0xAA; 4];
+        let mut cursor = Cursor::new(data);
+        let err = cursor.read_vec::<u32>(8).expect_err("a short stream must not satisfy 8 elements");
+        assert!(
+            err.to_string().contains("Unable to read vec"),
+            "expected a short-read error, got: {err}"
+        );
+
+        // The pathological case: a count no machine can satisfy. Reaching an error
+        // rather than an abort IS the assertion.
+        let mut cursor = Cursor::new(vec![0u8; 16]);
+        assert!(
+            cursor.read_vec::<u64>(usize::MAX / 16).is_err(),
+            "an absurd count must be refused rather than reserved"
+        );
+    }
+
+    /// Zero-sized elements carry no payload, so chunked reading could not converge
+    /// — the count would be pure allocation with nothing to consume it.
+    #[test]
+    fn zero_sized_elements_are_refused() {
+        #[derive(Default, Clone, Copy)]
+        #[repr(C)]
+        struct Zst;
+        unsafe impl bytemuck::Zeroable for Zst {}
+        unsafe impl bytemuck::AnyBitPattern for Zst {}
+        unsafe impl bytemuck::NoUninit for Zst {}
+
+        let mut cursor = Cursor::new(vec![0u8; 8]);
+        assert!(cursor.read_vec::<Zst>(1).is_err(), "a ZST vec must be refused");
+    }
 
     #[test]
     fn test_read_crate_struct() {

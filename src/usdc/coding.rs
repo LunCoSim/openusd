@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, io, mem};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context, Result};
 use num_traits::{AsPrimitive, PrimInt};
 
 use super::reader::ReadExt;
@@ -14,12 +14,17 @@ const SMALL: u8 = 1;
 const MEDIUM: u8 = 2;
 const LARGE: u8 = 3;
 
+/// Saturating throughout: `count` reaches here straight from a file-declared
+/// array length, so the arithmetic must not overflow into a small, plausible
+/// buffer size. Saturation yields an absurdly large size instead, which the
+/// caller's allocation bound then refuses — the safe direction.
 pub fn encoded_buffer_size<T: PrimInt>(count: usize) -> usize {
     if count == 0 {
         0
     } else {
         let sz = mem::size_of::<T>();
-        sz + (count * 2).div_ceil(8) + (sz * count)
+        sz.saturating_add(count.saturating_mul(2).div_ceil(8))
+            .saturating_add(sz.saturating_mul(count))
     }
 }
 
@@ -41,12 +46,35 @@ where
         codes_reader.read_pod::<i32>()? as i64
     };
 
-    let num_code_bytes = (count * 2).div_ceil(8);
+    let num_code_bytes = count.saturating_mul(2).div_ceil(8);
 
+    // The code-byte block and the integer block that follows it must both fit in
+    // the buffer we were handed. `count` is file-declared and `offset` is derived
+    // from it, so an over-large count used to slice past the end and panic —
+    // `&data[offset..]` is not a checked operation.
     let mut ints_reader = {
-        let offset = mem::size_of::<T>() + num_code_bytes;
-        io::Cursor::new(&data[offset..])
+        let offset = mem::size_of::<T>().saturating_add(num_code_bytes);
+        let rest = data.get(offset..).with_context(|| {
+            format!(
+                "Encoded int block declares {count} ints needing {offset} bytes of \
+                 header, but only {} bytes are available",
+                data.len(),
+            )
+        })?;
+        io::Cursor::new(rest)
     };
+
+    // Bound the reservation by what the buffer could possibly encode: every
+    // integer costs at least one code-bit pair, so `count` cannot exceed four
+    // times the available code bytes. Without this a declared count of 2^60
+    // reserves the whole address space before the first byte is decoded.
+    let max_decodable = data.len().saturating_mul(4);
+    ensure!(
+        count <= max_decodable,
+        "Encoded int block declares {count} ints, more than the {} bytes supplied \
+         could encode (max {max_decodable}); refusing to allocate",
+        data.len(),
+    );
 
     let mut prev = 0_i64;
     let mut output = Vec::with_capacity(count);
@@ -197,6 +225,29 @@ fn fits_in_i32(v: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A count larger than the buffer could possibly encode must be refused
+    /// before `Vec::with_capacity` reserves it.
+    #[test]
+    fn an_impossible_count_is_refused() {
+        // Refused, not reserved — either bound may catch it first (the derived
+        // header offset runs past the buffer before the count bound is reached),
+        // so the assertion is that it errors rather than which guard fired.
+        let data = vec![0u8; 16];
+        assert!(
+            decode_ints::<i32>(&data, usize::MAX / 8).is_err(),
+            "an impossible count must be refused rather than reserved"
+        );
+    }
+
+    /// A count whose derived header offset runs past the buffer must error rather
+    /// than panic on the slice — `&data[offset..]` is not a checked operation.
+    #[test]
+    fn a_truncated_buffer_errors_instead_of_panicking() {
+        // Header alone (4 bytes for i32) exceeds this buffer once code bytes are added.
+        let data = vec![0u8; 4];
+        assert!(decode_ints::<i32>(&data, 8).is_err(), "truncated buffer must error");
+    }
 
     #[test]
     fn roundtrip_empty() {

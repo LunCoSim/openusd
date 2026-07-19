@@ -79,9 +79,36 @@ impl<R: Read + Seek> Archive<R> {
             .by_name(file_path)
             .with_context(|| format!("File '{}' not found in archive", file_path))?;
 
+        // ZIP BOMB BOUND. `read_to_end` on a zip entry inflates until the stream
+        // ends, and a USDZ is an ordinary zip: a few KiB of entry can declare —
+        // and deliver — gigabytes of output, so an unbounded read here is a remote
+        // OOM against anything that opens an untrusted archive.
+        //
+        // The entry's own declared size is the bound, cross-checked against a hard
+        // ceiling so a lying header cannot raise its own limit. Reading one byte
+        // past the declaration is what proves the entry lied, which is why the
+        // limit is `declared + 1` rather than `declared`.
+        const MAX_ENTRY_BYTES: u64 = 1 << 30; // 1 GiB per archive member
+        let declared = file.size();
+        if declared > MAX_ENTRY_BYTES {
+            bail!(
+                "Archive member '{file_path}' declares {declared} bytes, over the \
+                 {MAX_ENTRY_BYTES}-byte limit; refusing to inflate",
+            );
+        }
+
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .with_context(|| format!("Failed to read file '{}' from archive", file_path))?;
+        let read = (&mut file)
+            .take(declared.saturating_add(1))
+            .read_to_end(&mut buffer)
+            .with_context(|| format!("Failed to read file '{}' from archive", file_path))? as u64;
+
+        if read > declared {
+            bail!(
+                "Archive member '{file_path}' inflated past its declared {declared} bytes; \
+                 refusing a zip bomb",
+            );
+        }
 
         if file_path.ends_with(".usdz") {
             // TODO: Implement nested USDZ files support.
