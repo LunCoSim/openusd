@@ -3039,6 +3039,22 @@ impl StageBuilder {
         self
     }
 
+    /// Whether payload arcs are composed while the stage is populated. Mirrors
+    /// C++ `UsdStage::Open`'s `UsdStage::InitialLoadSet` argument.
+    ///
+    /// [`InitialLoadSet::LoadNone`] is what makes a stage readable as a
+    /// CATALOGUE: the payload arcs are still visible as composition (see
+    /// [`Prim::payload_asset_paths`](super::Prim::payload_asset_paths)), but the
+    /// layers they name are never opened. Without it, asking a layer what it
+    /// REFERS to costs opening everything it refers to — and for a stage whose
+    /// payloads are whole scenes, a metadata read becomes a scene load.
+    ///
+    /// Payloads can be brought in afterwards per-prim with [`Stage::load`].
+    pub fn initial_load_set(mut self, set: InitialLoadSet) -> Self {
+        self.initial_load_set = set;
+        self
+    }
+
     /// Sets the session layer for the stage.
     ///
     /// The session layer provides the strongest opinions in the composition,

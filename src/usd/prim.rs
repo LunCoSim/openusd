@@ -381,6 +381,13 @@ impl Prim {
     }
 
     /// `true` if the prim index contains at least one composition arc.
+    /// The asset paths this prim's `payload` arcs name, strongest first; empty
+    /// when it declares none. Reads the arc without loading it — see
+    /// [`payload_asset_paths`].
+    pub fn payload_asset_paths(&self) -> anyhow::Result<Vec<String>> {
+        payload_asset_paths(&self.stage, &self.path)
+    }
+
     pub fn has_composition_arc(&self) -> anyhow::Result<bool> {
         self.stage
             .masked(&self.path, |g, cache| cache.has_composition_arc(g, &self.path))
@@ -670,6 +677,37 @@ impl Prim {
     }
 }
 
+/// The asset paths of the `payload` arcs composed at `prim`, strongest first.
+///
+/// Empty when the prim declares no payload — which is a meaningful answer, not a
+/// failure: "this prim has no deferred content" and "this prim's content failed
+/// to load" are different states, and only the arc distinguishes them.
+///
+/// READS THE ARC, NEVER LOADS IT. This is the counterpart to
+/// [`StageBuilder::initial_load_set`](super::StageBuilder::initial_load_set):
+/// with [`InitialLoadSet::LoadNone`](super::InitialLoadSet::LoadNone) a stage
+/// can be asked what its prims defer to without opening any of it. That makes a
+/// payload usable as a DECLARATION — "the content this prim stands for lives
+/// there" — which is what a catalogue, a dependency walk, or a loader deciding
+/// what to mount actually needs. C++ reaches the same information through
+/// `UsdPrim::GetPrimIndex`; this is the direct question.
+///
+/// A payload with only a `prim_path` (an internal payload, no asset) contributes
+/// nothing here — it names no file.
+pub fn payload_asset_paths(stage: &Stage, prim: &sdf::Path) -> anyhow::Result<Vec<String>> {
+    let payload = stage.field::<sdf::Value>(prim, sdf::FieldKey::Payload)?;
+    let arcs: Vec<sdf::Payload> = match payload {
+        Some(sdf::Value::Payload(p)) => vec![p],
+        Some(sdf::Value::PayloadListOp(op)) => op.reduced().flatten().to_vec(),
+        _ => Vec::new(),
+    };
+    Ok(arcs
+        .into_iter()
+        .map(|p| p.asset_path)
+        .filter(|a| !a.is_empty())
+        .collect())
+}
+
 /// `true` when a non-empty `payload` opinion is composed at `prim` — the
 /// per-prim check behind [`Prim::is_loaded`].
 pub(super) fn has_payload(stage: &Stage, prim: &sdf::Path) -> anyhow::Result<bool> {
@@ -764,6 +802,47 @@ mod tests {
 
     fn stage() -> anyhow::Result<Stage> {
         Stage::builder().in_memory("anon.usda")
+    }
+
+    /// A payload is READABLE AS A DECLARATION: with payloads unloaded, the arc's
+    /// asset path is still reported, and the layer it names is never opened.
+    ///
+    /// This pairing is the point — `initial_load_set(LoadNone)` alone leaves a
+    /// caller unable to see what was deferred, and `payload_asset_paths` alone
+    /// costs a full load to ask. Together they let a stage be read as a
+    /// catalogue: what does this prim stand for, without fetching it.
+    #[test]
+    fn payload_arcs_are_readable_without_loading_them() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join("openusd_payload_decl_test");
+        std::fs::create_dir_all(&dir)?;
+        let heavy = dir.join("heavy.usda");
+        std::fs::write(&heavy, "#usda 1.0\n(\n    defaultPrim = \"Heavy\"\n)\n\ndef Scope \"Heavy\"\n{\n}\n")?;
+        let root = dir.join("root.usda");
+        std::fs::write(
+            &root,
+            "#usda 1.0\n\ndef Scope \"Catalogue\"\n{\n    def Scope \"Entry\" (\n        prepend payload = @./heavy.usda@\n    )\n    {\n    }\n\n    def Scope \"NoWorld\"\n    {\n    }\n}\n",
+        )?;
+
+        let stage = Stage::builder()
+            .initial_load_set(crate::usd::InitialLoadSet::LoadNone)
+            .open(root.to_str().unwrap())?;
+
+        let entry = stage.prim("/Catalogue/Entry");
+        assert_eq!(
+            entry.payload_asset_paths()?,
+            vec!["./heavy.usda".to_string()],
+            "the arc must be reported even though it was never composed"
+        );
+        assert!(
+            !entry.is_loaded()?,
+            "LoadNone must leave the payload unloaded — else reading a catalogue loads every scene in it"
+        );
+
+        // Declaring no payload is an ANSWER, not a failure to have one.
+        assert!(stage.prim("/Catalogue/NoWorld").payload_asset_paths()?.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     /// Handles own a refcounted [`Stage`], so they can be collected and
