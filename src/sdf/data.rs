@@ -194,6 +194,93 @@ impl Data {
         self.specs.iter()
     }
 
+    /// The asset paths this layer's **composition arcs** name: `subLayers`,
+    /// `references` and `payload`, as authored (unresolved, unanchored).
+    ///
+    /// C++ `SdfLayer::GetCompositionAssetDependencies`. Returned in a stable
+    /// order — sublayers first, then arcs in spec-path order — so a caller that
+    /// hashes or diffs the result is not at the mercy of hash iteration.
+    ///
+    /// Every spec is scanned, not just the live prim tree: arcs authored inside
+    /// variant blocks live at decorated paths and are dependencies all the same.
+    ///
+    /// Paths come back exactly as written, because anchoring is the resolver's
+    /// job and this type has no resolver: a relative path is relative to the
+    /// layer that authored it, and a caller that wants files resolves them
+    /// against that layer's directory (or an [`ar::Resolver`](crate::ar::Resolver)).
+    pub fn composition_asset_dependencies(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(root) = self.specs.get(&Path::abs_root()) {
+            if let Some(Value::StringVec(subs)) = root.get("subLayers") {
+                out.extend(subs.iter().filter(|s| !s.is_empty()).cloned());
+            }
+        }
+        let mut paths: Vec<&Path> = self.specs.keys().collect();
+        paths.sort();
+        for path in paths {
+            let Some(spec) = self.specs.get(path) else {
+                continue;
+            };
+            if let Some(Value::ReferenceListOp(op)) = spec.get("references") {
+                out.extend(
+                    op.iter()
+                        .filter(|r| !r.asset_path.is_empty())
+                        .map(|r| r.asset_path.clone()),
+                );
+            }
+            match spec.get("payload") {
+                Some(Value::Payload(p)) if !p.asset_path.is_empty() => {
+                    out.push(p.asset_path.clone())
+                }
+                Some(Value::PayloadListOp(op)) => out.extend(
+                    op.iter()
+                        .filter(|p| !p.asset_path.is_empty())
+                        .map(|p| p.asset_path.clone()),
+                ),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The asset paths this layer's **asset-valued attributes** name, as
+    /// authored (unresolved, unanchored).
+    ///
+    /// The other half of what a layer depends on, and the half a composition
+    /// walk cannot see: a texture, a mesh a schema binds by `asset` attribute, a
+    /// program bound through `info:sourceAsset`. None of these are composition
+    /// arcs, so they never appear in [`composition_asset_dependencies`] — and a
+    /// consumer that ships or watches a layer's files needs both. Together they
+    /// are what C++ `UsdUtils.ComputeAllDependencies` reports for one layer.
+    ///
+    /// Only `default` values are read. A time-sampled asset path is an animated
+    /// binding, not a load-time dependency, and reporting one as a file to ship
+    /// would be wrong for every consumer that exists.
+    ///
+    /// [`composition_asset_dependencies`]: Self::composition_asset_dependencies
+    pub fn asset_dependencies(&self) -> Vec<String> {
+        let mut paths: Vec<&Path> = self.specs.keys().collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for path in paths {
+            let Some(spec) = self.specs.get(path) else {
+                continue;
+            };
+            match spec.get("default") {
+                Some(Value::AssetPath(a)) if !a.authored_path.is_empty() => {
+                    out.push(a.authored_path.clone())
+                }
+                Some(Value::AssetPathVec(v)) => out.extend(
+                    v.iter()
+                        .filter(|a| !a.authored_path.is_empty())
+                        .map(|a| a.authored_path.clone()),
+                ),
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Number of specs in the container.
     pub fn len(&self) -> usize {
         self.specs.len()
@@ -636,6 +723,69 @@ mod tests {
 
         let value = data.get_field(&root, "primChildren").unwrap().into_owned();
         assert_eq!(value, Value::TokenVec(vec!["child".into()]));
+    }
+
+    /// Both dependency kinds, off one parsed layer — including the arc authored
+    /// inside a variant block (a decorated spec path, invisible to a walk of the
+    /// live prim tree) and an `asset` attribute, which no composition walk sees.
+    #[test]
+    fn dependencies_cover_composition_arcs_and_asset_attributes() {
+        let text = r#"#usda 1.0
+(
+    subLayers = [@base.usda@]
+)
+
+def Xform "Rig" (
+    prepend references = @../vessels/rover.usda@
+    prepend payload = @heavy.usda@
+)
+{
+    asset info:sourceAsset = @./behaviour.rhai@
+    asset[] inputs:textures = [@tex/albedo.png@, @tex/normal.png@]
+
+    variantSet "lod" = {
+        "high" (prepend references = @detail_high.usda@) { }
+    }
+}
+"#;
+        let specs = crate::usda::parser::Parser::new(text).parse().expect("parse");
+        let data = Data::from_specs(specs);
+
+        let comp = data.composition_asset_dependencies();
+        assert_eq!(comp.first().map(String::as_str), Some("base.usda"), "sublayers lead");
+        for expected in ["../vessels/rover.usda", "heavy.usda", "detail_high.usda"] {
+            assert!(comp.contains(&expected.to_string()), "missing arc {expected} in {comp:?}");
+        }
+
+        let assets = data.asset_dependencies();
+        for expected in ["./behaviour.rhai", "tex/albedo.png", "tex/normal.png"] {
+            assert!(
+                assets.contains(&expected.to_string()),
+                "missing asset attribute {expected} in {assets:?}"
+            );
+        }
+        // The two are disjoint kinds: an `asset` attribute is not a composition
+        // arc, which is exactly why a consumer needs both calls.
+        assert!(!comp.iter().any(|c| c.ends_with(".rhai")));
+        assert!(!assets.iter().any(|a| a.ends_with("rover.usda")));
+    }
+
+    /// Stable order, so a manifest hash over the result does not churn between
+    /// runs on `HashMap` iteration order.
+    #[test]
+    fn dependency_order_is_stable() {
+        let text = r#"#usda 1.0
+def "A" ( prepend references = @a.usda@ ) { asset x = @ax.png@ }
+def "B" ( prepend references = @b.usda@ ) { asset x = @bx.png@ }
+def "C" ( prepend references = @c.usda@ ) { asset x = @cx.png@ }
+"#;
+        let specs = crate::usda::parser::Parser::new(text).parse().expect("parse");
+        let data = Data::from_specs(specs);
+        let first = (data.composition_asset_dependencies(), data.asset_dependencies());
+        for _ in 0..8 {
+            let again = (data.composition_asset_dependencies(), data.asset_dependencies());
+            assert_eq!(first, again, "order must not depend on hash iteration");
+        }
     }
 
     #[test]
