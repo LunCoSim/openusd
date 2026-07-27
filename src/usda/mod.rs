@@ -11,7 +11,7 @@ mod writer;
 
 use parser::Parser;
 
-pub use writer::TextWriter;
+pub use writer::{format_value_literal, TextWriter};
 
 use crate::{ar, sdf, tf};
 

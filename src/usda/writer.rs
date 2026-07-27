@@ -845,6 +845,18 @@ impl<W: Write> Emitter<'_, W> {
 
 // ---------- value formatter (string-producing) ----------
 
+/// Format a single attribute value as its USDA literal (the text after ` = `
+/// in an attribute spec), e.g. `[(0, 0, 1), (1, 0, 0)]` for a `Vec3fVec`.
+///
+/// Arrays, vectors and matrices are single-line by construction. Errors on
+/// [`Value::None`] and [`Value::Value`], which have no USDA literal form —
+/// see [`format_value`].
+pub fn format_value_literal(v: &Value) -> Result<String> {
+    let mut s = String::new();
+    format_value(&mut s, v)?;
+    Ok(s)
+}
+
 fn format_value(s: &mut String, v: &Value) -> Result<()> {
     match v {
         // The USDA parser reads the `None` token as `Value::ValueBlock`. Emitting
@@ -1424,6 +1436,42 @@ mod tests {
         let data = Data::new();
         let text = TextWriter::write_to_string(&data as &dyn AbstractData).unwrap();
         assert_eq!(text, "#usda 1.0\n");
+    }
+
+    #[test]
+    fn value_literal_is_single_line_for_arrays_and_matrices() {
+        use crate::gf::Vec3d;
+        let cases: Vec<(Value, &str)> = vec![
+            (Value::Float(1.5), "1.5"),
+            (Value::FloatVec(vec![0.5, 1.5, -2.5]), "[0.5, 1.5, -2.5]"),
+            (
+                Value::Vec3dVec(vec![
+                    Vec3d {
+                        x: 0.5,
+                        y: 0.5,
+                        z: 1.5,
+                    },
+                    Vec3d {
+                        x: 1.5,
+                        y: 0.5,
+                        z: 0.5,
+                    },
+                ]),
+                "[(0.5, 0.5, 1.5), (1.5, 0.5, 0.5)]",
+            ),
+            (
+                Value::TokenVec(vec!["a".into(), "b".into()]),
+                "[\"a\", \"b\"]",
+            ),
+            (Value::ValueBlock, "None"),
+        ];
+        for (value, expected) in cases {
+            let lit = format_value_literal(&value).unwrap();
+            assert_eq!(lit, expected);
+            assert!(!lit.contains('\n'), "literal must be single-line: {lit}");
+        }
+        assert!(format_value_literal(&Value::None).is_err());
+        assert!(format_value_literal(&Value::Value).is_err());
     }
 
     #[test]
