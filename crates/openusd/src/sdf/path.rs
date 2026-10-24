@@ -71,16 +71,19 @@ static EMPTY: LazyLock<Arc<Text>> = LazyLock::new(|| Arc::new(Text::new(String::
 /// The text of the absolute root path, shared by every [`Path::abs_root`].
 static ABS_ROOT: LazyLock<Arc<Text>> = LazyLock::new(|| Arc::new(Text::new(String::from("/"))));
 
-/// A path's shared text and its hash.
+/// A path's shared text view, hash and owning-prim node.
 ///
 /// Clones of a [`Path`] share one `Text`, whose hash is computed once, when
 /// the path is made. A path keying several maps, or one map many times, does
 /// not read its text again to hash it. Equality and ordering compare the text.
 struct Text {
-    text: String,
+    source: Arc<String>,
+    len: usize,
     /// The text's hash under a fixed-key hasher. Equal texts in separate
     /// allocations hash alike.
     hash: u64,
+    /// The owning prim when it is a strict prefix; `None` designates this text.
+    prim: Option<Path>,
 }
 
 impl Default for Path {
@@ -159,9 +162,30 @@ impl Path {
 
     /// Wraps already-validated `text`.
     fn from_text(text: String) -> Path {
-        Path {
+        Self::with_prim(Path {
             path: Arc::new(Text::new(text)),
+        })
+    }
+
+    /// Populate immutable owning-prim nodes before publishing their shared text.
+    fn with_prim(mut path: Path) -> Path {
+        let mut nodes = Vec::new();
+        loop {
+            let len = path.prim_len();
+            if len == path.path.len() {
+                break;
+            }
+            let prim = path.prefix_node(len);
+            nodes.push(path);
+            path = prim;
         }
+        while let Some(mut node) = nodes.pop() {
+            Arc::get_mut(&mut node.path)
+                .expect("unshared path under construction")
+                .prim = Some(path);
+            path = node;
+        }
+        path
     }
 
     /// Takes `path` without validating it, like
@@ -416,17 +440,27 @@ impl Path {
         false
     }
 
+    /// The owning prim's path (C++ `SdfPath::GetPrimPath`), shared across clones.
     pub fn prim_path(&self) -> Path {
-        self.prefix(self.prim_len())
+        self.prim_prefix().clone()
     }
 
-    /// The first `len` bytes of this path as a path of their own, sharing
-    /// this one's text when `len` covers all of it.
-    fn prefix(&self, len: usize) -> Path {
-        if len == self.path.len() {
-            return self.clone();
+    /// Borrow the owning prim derived from this immutable path's shared text.
+    fn prim_prefix(&self) -> &Path {
+        self.path.prim.as_ref().unwrap_or(self)
+    }
+
+    /// A validated prefix node sharing this path's source allocation.
+    fn prefix_node(&self, len: usize) -> Path {
+        let text = &self.path[..len];
+        debug_assert!(text.is_empty() || Path::validate(text).is_ok());
+        match text {
+            "" => Path::default(),
+            "/" => Path::abs_root(),
+            _ => Path {
+                path: Arc::new(Text::view(self.path.source.clone(), len)),
+            },
         }
-        Path::from_str_unchecked(&self.path[..len])
     }
 
     /// The byte length of this path's [`prim_path`](Self::prim_path) prefix,
@@ -479,7 +513,7 @@ impl Path {
     /// `.foo[/T].bar` for a target/namespaced property). Empty for a prim
     /// (non-property) path.
     pub fn property_suffix(&self) -> &str {
-        &self.path[self.prim_len()..]
+        &self.path[self.prim_prefix().path.len()..]
     }
 
     /// Splits this path into its [`prim_path`](Self::prim_path) and the
@@ -490,8 +524,8 @@ impl Path {
     /// "/World/Mesh"        -> ("/World/Mesh", "")
     /// ```
     pub fn split_prim(&self) -> (Path, &str) {
-        let len = self.prim_len();
-        (self.prefix(len), &self.path[len..])
+        let prim = self.prim_prefix();
+        (prim.clone(), &self.path[prim.path.len()..])
     }
 
     /// Splits a property path into its owning prim and the property name (the
@@ -1479,11 +1513,31 @@ impl TryFrom<&String> for Path {
 
 impl Text {
     fn new(text: String) -> Self {
+        let len = text.len();
+        Self::view(Arc::new(text), len)
+    }
+
+    fn view(source: Arc<String>, len: usize) -> Self {
         let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
+        source[..len].hash(&mut hasher);
         Self {
             hash: hasher.finish(),
-            text,
+            source,
+            len,
+            prim: None,
+        }
+    }
+}
+
+impl Drop for Text {
+    fn drop(&mut self) {
+        // Unique prefix chains release in constant stack space.
+        let mut prim = self.prim.take();
+        while let Some(path) = prim {
+            match Arc::try_unwrap(path.path) {
+                Ok(mut text) => prim = text.prim.take(),
+                Err(_) => break,
+            }
         }
     }
 }
@@ -1492,7 +1546,7 @@ impl Deref for Text {
     type Target = str;
 
     fn deref(&self) -> &str {
-        &self.text
+        &self.source[..self.len]
     }
 }
 
@@ -1504,7 +1558,7 @@ impl Hash for Text {
 
 impl PartialEq for Text {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.text == other.text
+        self.hash == other.hash && **self == **other
     }
 }
 
@@ -1518,19 +1572,19 @@ impl PartialOrd for Text {
 
 impl Ord for Text {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.text.cmp(&other.text)
+        self[..].cmp(&other[..])
     }
 }
 
 impl fmt::Debug for Text {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.text, f)
+        fmt::Debug::fmt(&&**self, f)
     }
 }
 
 impl fmt::Display for Text {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.text, f)
+        fmt::Display::fmt(&**self, f)
     }
 }
 
@@ -1594,6 +1648,124 @@ pub(crate) mod tests {
         assert!(paths.contains(&independent));
     }
 
+    #[test]
+    fn prim_derivation_shared() {
+        for text in [
+            "/World/Robot.inputs:force",
+            "/A.rel[/T].attr",
+            "/A{v=x}B.attr",
+            "/A{v=x}",
+            "Foo.bar",
+            ".bar",
+            "../A.radius",
+            "/Root/Branch",
+        ] {
+            let path = Path::new(text).unwrap();
+            let expected = Path::from_str_unchecked(&path.path[..path.prim_len()]);
+            let first = path.prim_path();
+            let clone = path.clone();
+            let (second, suffix) = clone.split_prim();
+            assert_eq!(first, expected);
+            assert_eq!(suffix, path.property_suffix());
+            assert!(Arc::ptr_eq(&first.path, &second.path), "{text}");
+            let mut set = HashSet::new();
+            set.insert(path.clone());
+            assert!(set.contains(&Path::new(text).unwrap()));
+        }
+    }
+
+    #[test]
+    fn prim_prefix_views() {
+        let path = Path::new("/Root/Branch.value").unwrap();
+        let prim = path.prim_path();
+        let independent = Path::new("/Root/Branch").unwrap();
+        assert!(Arc::ptr_eq(&path.path.source, &prim.path.source));
+        assert_eq!(prim, independent);
+        assert_eq!(prim.cmp(&independent), cmp::Ordering::Equal);
+        assert_eq!(format!("{prim:?}"), format!("{independent:?}"));
+        assert_eq!(prim.to_string(), "/Root/Branch");
+        let mut map = PathMap::default();
+        map.insert(prim, 7);
+        assert_eq!(map.get(&independent), Some(&7));
+    }
+
+    #[test]
+    fn prim_chain_release() {
+        use std::thread;
+        thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let text = format!("/Root{}", "{v=x}".repeat(512));
+                let path = Path::new(&text).unwrap();
+                assert_eq!(path.as_str(), text);
+                assert_eq!(path.prim_path().as_str().len(), text.len() - 5);
+                drop(path);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn prim_derivation_releases() {
+        for text in ["/Root/Branch", "/Root/Branch.value", "/Root{v=x}"] {
+            let (original, derived) = {
+                let path = Path::new(text).unwrap();
+                let prim = path.prim_path();
+                (Arc::downgrade(&path.path), Arc::downgrade(&prim.path))
+            };
+            assert!(original.upgrade().is_none(), "{text}");
+            assert!(derived.upgrade().is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn prim_derivation_threads() {
+        use std::{sync::Barrier, thread};
+        let path = Path::new("/World/Robot.inputs:force").unwrap();
+        let barrier = Barrier::new(8);
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        for _ in 0..128 {
+                            assert_eq!(path.property_suffix(), ".inputs:force");
+                            assert_eq!(path.split_prim().0.as_str(), "/World/Robot");
+                        }
+                        path.prim_path()
+                    })
+                })
+                .collect();
+            let prefixes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+            assert!(prefixes.iter().all(|prim| Arc::ptr_eq(&prim.path, &prefixes[0].path)));
+        });
+    }
+
+    #[test]
+    #[ignore = "explicit path derivation timing diagnostic"]
+    fn prim_derivation_timing() {
+        use std::{hint::black_box, time::Instant};
+        let prim =
+            Path::new("/World/AssemblyWithRepresentativeNamespace/ComponentWithRepresentativeNamespace/Geometry")
+                .unwrap();
+        let mut durations = Vec::new();
+        for _ in 0..3 {
+            let started = Instant::now();
+            for _ in 0..5000 {
+                let path = prim.append_property("inputs:force").unwrap();
+                for _ in 0..6 {
+                    black_box(path.prim_path());
+                    black_box(path.split_prim());
+                    black_box(path.property_suffix());
+                }
+            }
+            durations.push(started.elapsed().as_nanos());
+        }
+        durations.sort_unstable();
+        println!("prim_derivation_ns={durations:?} median_ns={}", durations[1]);
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn serde_as_string() {
@@ -1602,6 +1774,7 @@ pub(crate) mod tests {
             Path::abs_root(),
             Path::new("/Root.rel[/Target]").unwrap(),
         ] {
+            let _ = path.prim_path();
             let encoded = serde_json::to_string(&path).unwrap();
             assert_eq!(encoded, serde_json::to_string(path.as_str()).unwrap());
             assert_eq!(serde_json::from_str::<Path>(&encoded).unwrap(), path);
