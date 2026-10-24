@@ -269,7 +269,14 @@ impl Path {
             ));
         }
 
-        Ok(Path::from_text([self.as_str(), ".", property].concat()))
+        let prim = if self.is_variant_selection() {
+            self.clone()
+        } else {
+            self.prim_path()
+        };
+        let mut text = Text::new([self.as_str(), ".", property].concat());
+        text.prim = Some(prim);
+        Ok(Path { path: Arc::new(text) })
     }
 
     /// Appends `path` (parsed if given as a string) under this path with a `/`
@@ -1671,6 +1678,31 @@ pub(crate) mod tests {
             let mut set = HashSet::new();
             set.insert(path.clone());
             assert!(set.contains(&Path::new(text).unwrap()));
+        }
+    }
+
+    #[test]
+    fn property_owner_shared() {
+        for text in [
+            "/Root/Branch",
+            "/A{v=x}B",
+            "/A{v=x}",
+            "../A",
+            "Foo",
+            "/A.rel[/T]",
+            "/A.rel[/T].b[/U]",
+        ] {
+            let base = Path::new(text).unwrap();
+            let property = base.append_property("inputs:force").unwrap();
+            let parsed = Path::new(&format!("{text}.inputs:force")).unwrap();
+            assert_eq!(property, parsed);
+            assert_eq!(property.prim_path(), parsed.prim_path());
+            let owner = if base.is_variant_selection() {
+                base.clone()
+            } else {
+                base.prim_path()
+            };
+            assert!(Arc::ptr_eq(&property.prim_path().path, &owner.path), "{text}");
         }
     }
 
