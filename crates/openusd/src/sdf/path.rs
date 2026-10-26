@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::{cmp, convert::Infallible, fmt, str::FromStr};
 
 use rustc_hash::FxBuildHasher;
@@ -71,7 +71,7 @@ static EMPTY: LazyLock<Arc<Text>> = LazyLock::new(|| Arc::new(Text::new(String::
 /// The text of the absolute root path, shared by every [`Path::abs_root`].
 static ABS_ROOT: LazyLock<Arc<Text>> = LazyLock::new(|| Arc::new(Text::new(String::from("/"))));
 
-/// A path's shared text view, hash and owning-prim node.
+/// A path's shared text view, hash and derived prefix nodes.
 ///
 /// Clones of a [`Path`] share one `Text`, whose hash is computed once, when
 /// the path is made. A path keying several maps, or one map many times, does
@@ -84,6 +84,7 @@ struct Text {
     hash: u64,
     /// The owning prim when it is a strict prefix; `None` designates this text.
     prim: Option<Path>,
+    parent: OnceLock<Option<Path>>,
 }
 
 impl Default for Path {
@@ -659,7 +660,13 @@ impl Path {
     /// "/"           -> None
     /// ""            -> None
     /// ```
+    ///
+    /// Clones share the derived parent and its prefix text storage.
     pub fn parent(&self) -> Option<Path> {
+        self.path.parent.get_or_init(|| self.derive_parent()).clone()
+    }
+
+    fn derive_parent(&self) -> Option<Path> {
         if self.path.is_empty() || self.as_str() == "/" {
             return None;
         }
@@ -667,7 +674,7 @@ impl Path {
         if self.is_variant_selection()
             && let Some(open) = self.path.rfind('{')
         {
-            return Some(Path::from_str_unchecked(&self.path[..open]));
+            return Some(self.parent_prefix(open));
         }
         // A relationship/connection target path (`/A.rel[/T]`): its parent is
         // the property owning the bracket, as in C++ `SdfPath::GetParentPath`.
@@ -679,7 +686,7 @@ impl Path {
                     b'[' => {
                         nesting -= 1;
                         if nesting == 0 {
-                            return Some(Path::from_str_unchecked(&self.path[..i]));
+                            return Some(self.parent_prefix(i));
                         }
                     }
                     _ => {}
@@ -696,12 +703,21 @@ impl Path {
         // selection, `/A{v=s}B`), whichever is rightmost.
         match self.path.rfind(['/', '}']) {
             // Child of a variant selection: keep up to and including the `}`.
-            Some(i) if self.path.as_bytes()[i] == b'}' => Some(Path::from_str_unchecked(&self.path[..i + 1])),
+            Some(i) if self.path.as_bytes()[i] == b'}' => Some(self.parent_prefix(i + 1)),
             Some(0) => Some(Path::abs_root()),
             // Child of another prim: drop the `/` and the name.
-            Some(i) => Some(Path::from_str_unchecked(&self.path[..i])),
+            Some(i) => Some(self.parent_prefix(i)),
             None => None,
         }
+    }
+
+    fn parent_prefix(&self, len: usize) -> Path {
+        if let Some(prim) = &self.path.prim
+            && prim.path.len == len
+        {
+            return prim.clone();
+        }
+        Self::with_prim(self.prefix_node(len))
     }
 
     /// Iterates `self` followed by each strict ancestor, ending with the
@@ -1532,18 +1548,36 @@ impl Text {
             source,
             len,
             prim: None,
+            parent: OnceLock::new(),
+        }
+    }
+
+    fn take_prefix(&mut self, pending: &mut Vec<Path>) -> Option<Path> {
+        match (self.prim.take(), self.parent.take().flatten()) {
+            (Some(prim), Some(parent)) => {
+                if !Arc::ptr_eq(&prim.path, &parent.path) {
+                    pending.push(prim);
+                }
+                Some(parent)
+            }
+            (prim, parent) => prim.or(parent),
         }
     }
 }
 
 impl Drop for Text {
     fn drop(&mut self) {
-        // Unique prefix chains release in constant stack space.
-        let mut prim = self.prim.take();
-        while let Some(path) = prim {
-            match Arc::try_unwrap(path.path) {
-                Ok(mut text) => prim = text.prim.take(),
-                Err(_) => break,
+        // Prefix edges always shorten the text. Release the graph iteratively
+        // so deeply nested paths use bounded call-stack space.
+        let mut pending = Vec::new();
+        let mut next = self.take_prefix(&mut pending);
+        while let Some(path) = next {
+            next = match Arc::try_unwrap(path.path) {
+                Ok(mut text) => text.take_prefix(&mut pending),
+                Err(_) => None,
+            };
+            if next.is_none() {
+                next = pending.pop();
             }
         }
     }
@@ -1635,6 +1669,121 @@ pub(crate) mod tests {
             &Path::new(".bar").unwrap().prim_path().path,
             &Path::default().path
         ));
+    }
+
+    #[test]
+    #[ignore = "explicit parent construction and traversal timing"]
+    fn parent_derivation_timing() {
+        use std::{hint::black_box, time::Instant};
+        let text = "/World/AssemblyWithRepresentativeNamespace/ComponentWithRepresentativeNamespace/Geometry";
+        for reads in [0, 1, 8] {
+            for ancestors in [false, true] {
+                let started = Instant::now();
+                for _ in 0..5000 {
+                    let path = Path::new(black_box(text)).unwrap();
+                    for _ in 0..reads {
+                        if ancestors {
+                            for ancestor in path.strict_ancestors() {
+                                black_box(ancestor);
+                            }
+                        } else {
+                            black_box(path.parent());
+                        }
+                    }
+                    black_box(path);
+                }
+                println!(
+                    "PARENT reads={reads} ancestors={ancestors} ns={}",
+                    started.elapsed().as_nanos()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parent_prefix_shared() {
+        for text in [
+            "/Root/Branch",
+            "/A{v=x}B",
+            "/A{v=x}{w=y}",
+            "/A.rel[/T].b[/U]",
+            "/A.rel[/T.rel[/U]]",
+            "../A.radius",
+            ".attr",
+            ".",
+            "..",
+            "Foo",
+            "/",
+        ] {
+            let path = Path::new(text).unwrap();
+            let clone = path.clone();
+            let mut keys = PathMap::default();
+            keys.insert(path.clone(), 9);
+            let first = path.parent();
+            let second = clone.parent();
+            assert_eq!(first, second);
+            assert_eq!(keys.get(&Path::new(text).unwrap()), Some(&9));
+            if let Some(first) = first {
+                let second = second.unwrap();
+                assert!(Arc::ptr_eq(&first.path, &second.path), "{text}");
+                let parsed = Path::from_str_unchecked(first.as_str());
+                assert_eq!(first, parsed);
+                assert_eq!(first.prim_path(), parsed.prim_path());
+                if !first.is_empty() && !first.is_abs_root() {
+                    assert!(Arc::ptr_eq(&first.path.source, &path.path.source));
+                }
+                let mut map = PathMap::default();
+                map.insert(first.clone(), 7);
+                assert_eq!(map.get(&parsed), Some(&7));
+                assert_eq!(first.cmp(&parsed), cmp::Ordering::Equal);
+            }
+        }
+        assert_eq!(Path::default().parent(), None);
+    }
+
+    #[test]
+    fn parent_threads_share() {
+        use std::{sync::Barrier, thread};
+        let path = Path::new("/Root/Branch.rel[/Target]").unwrap();
+        let barrier = Barrier::new(8);
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        path.parent().unwrap()
+                    })
+                })
+                .collect();
+            let parents: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+            assert!(parents.iter().all(|parent| Arc::ptr_eq(&parent.path, &parents[0].path)));
+        });
+    }
+
+    #[test]
+    fn parent_graph_release() {
+        use std::thread;
+        thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                for text in [
+                    format!("/Root{}", "/Child".repeat(2048)),
+                    format!("/Root{}.rel[/Target].attr", "{v=x}".repeat(512)),
+                ] {
+                    let path = Path::new(&text).unwrap();
+                    let nodes: Vec<_> = path
+                        .ancestors()
+                        .filter(|p| !p.is_abs_root())
+                        .map(|p| Arc::downgrade(&p.path))
+                        .collect();
+                    assert!(nodes.len() > 500);
+                    drop(path);
+                    assert!(nodes.iter().all(|node| node.upgrade().is_none()));
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -1807,6 +1956,7 @@ pub(crate) mod tests {
             Path::new("/Root.rel[/Target]").unwrap(),
         ] {
             let _ = path.prim_path();
+            let _ = path.parent();
             let encoded = serde_json::to_string(&path).unwrap();
             assert_eq!(encoded, serde_json::to_string(path.as_str()).unwrap());
             assert_eq!(serde_json::from_str::<Path>(&encoded).unwrap(), path);

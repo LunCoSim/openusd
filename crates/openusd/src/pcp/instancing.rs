@@ -538,10 +538,6 @@ impl IndexCache {
         if !self.mask_includes(path) {
             return Ok(false);
         }
-        // TODO(perf): every gated stage read lands here, and building the
-        // parent path allocates before the memo is probed. A borrowed parent
-        // accessor on `Path`, with the memo keyed to accept it, would make a
-        // memo hit allocation-free.
         match path.parent() {
             Some(parent) => self.is_populated(graph, &parent),
             // The pseudo-root, which nothing can deactivate.
